@@ -163,6 +163,12 @@ Huffman coding formalised the optimal parameter-free algorithm for symbol-freque
 
 ---
 
+## Hardware Considerations
+
+The core AIM operations — bit-plane sweep, bit-clear, remap, and the rANS encode/decode loop — are branchless, fixed-depth, and operate on independent byte elements, making them amenable to SIMD vectorisation. Existing AVX-512 primitives (VGATHER, VPERMB, VPSHUFB) cover the stride-gather and remap patterns directly. A SIMD-accelerated C implementation and formal throughput analysis are left for future work.
+
+---
+
 ## Intent
 
 This work is published with the intent that it benefit general computing, research, and the people who do it.
