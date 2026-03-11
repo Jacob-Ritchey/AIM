@@ -1,12 +1,17 @@
 /* aim.c — AIM Compression Algorithm, C Reference Implementation
- * Version: 15  |  Reference: aim_v14.py  |  Spec: AIM_Specification
+ * Version: 16  |  Reference: aim_v15.py  |  Spec: AIM_Specification_v16.docx
+ *
+ * v16 adds HALT_ANS_STRIDE (halt code 4): at each recursive depth the encoder
+ * computes an rANS order-1 stride-k encoding of the aligned stream and stores
+ * it as a candidate.  Bottom-up assembly picks the earliest depth where ANS-
+ * stride is cheaper than the remaining subtree (optimal cutoff, no heuristic).
+ * Stride k is selected by measuring H(X_i | X_{i-k}) over {1,2,3,4,6,8,12,16}.
  *
  * Build:  gcc -O3 -o aim aim.c -lz -lm
- * Usage:  ./aim encode <input> <output>
- *         ./aim decode <input> <output> [--no-verify]
+ * Usage:  ./aim encode <input> <o>
+ *         ./aim decode <input> <o> [--no-verify]
  *         ./aim bench  <file>
  */
-
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -457,7 +462,8 @@ static Buf ef_encode(const u32 *pos, size_t k, u64 N) {
     Buf out = buf_new(17 + (k*8)/8 + k/4 + 64);
     u8 hdr[17]; wr64(hdr,N); wr64(hdr+8,(u64)k);
     int l = (k==0||N==0) ? 0 : (int)floor(log2((double)N/k));
-    if (l<0) l=0; if (l>30) l=30;
+    if (l<0) l=0;
+    if (l>30) l=30;
     hdr[16] = (u8)l;
     buf_app(&out, hdr, 17);
 
@@ -511,7 +517,7 @@ ef_done:
 
 static Buf ef_decode(const u8 *data, size_t dn) {
     if (dn < 17) { Buf b=buf_new(4); return b; }
-    u64 N = rd64(data); u64 k = rd64(data+8); u8 l = data[16];
+    u64 k = rd64(data+8); u8 l = data[16]; (void)rd64(data);
     size_t pos = 17;
 
     Buf out = buf_new((size_t)k * sizeof(u32) + 4);
@@ -569,7 +575,7 @@ static Buf gamma_encode(const u32 *runs, size_t nr) {
         int k = 0; u32 tmp=x; while(tmp>1){k++;tmp>>=1;}
         /* write k zero bits */
         for (int j=0;j<k;j++) {
-            size_t by=bit_pos>>3; int bb=7-(bit_pos&7);
+            size_t by=bit_pos>>3;
             if (by>=out.cap) buf_grow(&out,out.cap);
             if (by>=out.n) { while(out.n<=by) buf_push(&out,0); }
             /* 0 bit — already 0 */
@@ -774,10 +780,12 @@ static Buf bitset_to_positions(const u8 *bs, size_t n) {
 }
 
 static int is_all_zero(const u8 *d, size_t n) {
-    for (size_t i=0;i<n;i++) if(d[i]) return 0; return 1;
+    for (size_t i=0;i<n;i++) if(d[i]) return 0;
+    return 1;
 }
 static int is_all_one(const u8 *d, size_t n) {
-    for (size_t i=0;i<n;i++) if(d[i]!=1) return 0; return 1;
+    for (size_t i=0;i<n;i++) if(d[i]!=1) return 0;
+    return 1;
 }
 
 
@@ -796,10 +804,27 @@ static const u8  AIM_MAGIC[4]   = {'A','I','M','4'};
 #define HALT_RECURSE  0
 #define HALT_TERMINAL 1
 #define HALT_ZERO     2
-#define HALT_ONE      3
+#define HALT_ONE        3
+#define HALT_ANS_STRIDE 4
 #define MAX_DEPTH      8
 #define EF_MAX_DENSITY  0.15
 #define GAP_MAX_DENSITY 0.30
+
+/* ── rANS constants ───────────────────────────────────────────────────────────────────────────────── */
+#define ANS_M_BITS   14
+#define ANS_M        (1u << ANS_M_BITS)   /* 16384 */
+#define ANS_L        ANS_M
+#define ANS_B        256u
+#define STRIDE_SAMPLE      1000000
+#define STRIDE_GAIN_THRESH 0.05
+
+/* Per-context (or global) frequency / cumulative / slot table.
+   Heap-allocated; one per context byte that has >= 32 observations. */
+typedef struct {
+    u16 freq[256];
+    u32 cum[256];
+    u8  slots[ANS_M];
+} AnsCtx;
 
 
 /* ── Flag format encode/decode ───────────────────────────────────────────── */
@@ -882,6 +907,305 @@ static Buf decode_fmt(const u8 *data, size_t dn, size_t n, int fmt) {
 }
 
 
+
+/* ── rANS order-1 stride-k codec ────────────────────────────────────────────
+ *
+ * NORMALISE
+ * ---------
+ * Given raw_freq[256] (u32 counts), produce freq (u16, sums to ANS_M),
+ * cum (u32 prefix sums), and slots[ANS_M] (decode lookup: slot -> symbol).
+ * Zero-count symbols get freq=0 and do not occupy any slots.
+ */
+static void ans_normalise(const u32 *raw, AnsCtx *ctx) {
+    u64 total = 0;
+    for (int i = 0; i < 256; i++) total += raw[i];
+
+    if (total == 0) {
+        memset(ctx->freq,  0, sizeof(ctx->freq));
+        memset(ctx->cum,   0, sizeof(ctx->cum));
+        memset(ctx->slots, 0, sizeof(ctx->slots));
+        return;
+    }
+
+    /* Initial rounded frequencies (at least 1 for any symbol present) */
+    int64_t f64[256]; int64_t sum = 0;
+    for (int i = 0; i < 256; i++) {
+        if (raw[i] > 0) {
+            int64_t v = (int64_t)round((double)raw[i] * ANS_M / (double)total);
+            f64[i] = v < 1 ? 1 : v;
+        } else {
+            f64[i] = 0;
+        }
+        sum += f64[i];
+    }
+
+    /* Adjust so sum == ANS_M exactly.
+       Sort active symbols by descending frequency (match Python behaviour). */
+    int active[256]; int na = 0;
+    for (int i = 0; i < 256; i++) if (f64[i] > 0) active[na++] = i;
+    /* insertion sort descending by f64 */
+    for (int i = 1; i < na; i++) {
+        int key = active[i]; int j = i - 1;
+        while (j >= 0 && f64[active[j]] < f64[key]) { active[j+1]=active[j]; j--; }
+        active[j+1] = key;
+    }
+    int64_t delta = (int64_t)ANS_M - sum;
+    int idx = 0;
+    while (delta != 0) {
+        int s = active[idx % na];
+        if (delta > 0)              { f64[s]++; delta--; }
+        else if (f64[s] > 1)        { f64[s]--; delta++; }
+        idx++;
+    }
+
+    /* Build cum and slots */
+    u32 acc = 0;
+    for (int s = 0; s < 256; s++) {
+        ctx->cum[s]  = acc;
+        ctx->freq[s] = (u16)f64[s];
+        for (u32 j = 0; j < (u32)f64[s]; j++) ctx->slots[acc + j] = (u8)s;
+        acc += (u32)f64[s];
+    }
+}
+
+/* CONDITIONAL ENTROPY  H(X_i | X_{i-k}) */
+static double ans_cond_entropy(const u8 *data, size_t n, int k) {
+    if ((size_t)k >= n) return 8.0;
+    u32 *pair = (u32*)calloc(256*256, sizeof(u32));
+    u32  ctx_c[256] = {0};
+    size_t total = n - (size_t)k;
+    for (size_t i = (size_t)k; i < n; i++) {
+        u8 c = data[i-k], s = data[i];
+        pair[(int)c*256 + s]++;
+        ctx_c[(int)c]++;
+    }
+    double H = 0.0;
+    for (int c = 0; c < 256; c++) {
+        if (!ctx_c[c]) continue;
+        for (int s = 0; s < 256; s++) {
+            u32 cnt = pair[c*256+s];
+            if (!cnt) continue;
+            double p   = (double)cnt / (double)total;
+            double pgc = (double)cnt / (double)ctx_c[c];
+            H -= p * log2(pgc);
+        }
+    }
+    free(pair);
+    return H;
+}
+
+/* SELECT STRIDE  k_opt = argmin_k H(X_i | X_{i-k})
+   Falls back to k=1 if gain is below STRIDE_GAIN_THRESH. */
+static int ans_select_stride(const u8 *data, size_t n) {
+    static const int cands[] = {1,2,3,4,6,8,12,16};
+    size_t probe = n > STRIDE_SAMPLE ? (size_t)STRIDE_SAMPLE : n;
+    double H1      = ans_cond_entropy(data, probe, 1);
+    double best_H  = H1;
+    int    k_opt   = 1;
+    for (int ci = 0; ci < 8; ci++) {
+        int k = cands[ci];
+        double H = ans_cond_entropy(data, probe, k);
+        if (H < best_H) { best_H = H; k_opt = k; }
+    }
+    if (H1 - best_H < STRIDE_GAIN_THRESH) k_opt = 1;
+    return k_opt;
+}
+
+/*
+ * ANS STRIDE ENCODE
+ * -----------------
+ * Wire format:
+ *   k_opt       (1B)
+ *   n           (4B BE)
+ *   global_freq (512B = 256 × u16 LE)
+ *   n_ctx       (2B BE)
+ *   n_ctx × [ ctx_byte(1B) + freq(512B = 256 × u16 LE) ]
+ *   payload_len (4B BE)
+ *   payload     state(4B BE) + renorm_bytes(LSB-first emission order)
+ *
+ * The global table is stored as a fixed 512-byte block BEFORE per-context
+ * tables to prevent collision with ctx_byte = 255.
+ */
+static Buf ans_stride_encode(const u8 *data, size_t n) {
+    /* Handle empty */
+    if (n == 0) {
+        Buf out = buf_new(4 + 512 + 2 + 4);  /* hdr + global + n_ctx=0 + plen=0 */
+        u8 tmp[4]; wr32(tmp, 0); buf_push(&out, 1); buf_app(&out, tmp, 4);
+        u8 gzero[512] = {0}; buf_app(&out, gzero, 512);
+        u8 nc[2]={0,0}; buf_app(&out,nc,2);
+        u8 pl[4]={0,0,0,0}; buf_app(&out,pl,4);
+        return out;
+    }
+
+    int k = ans_select_stride(data, n);
+
+    /* Build global raw counts */
+    u32 global_raw[256] = {0};
+    for (size_t i = 0; i < n; i++) global_raw[(int)data[i]]++;
+
+    /* Build per-context raw counts: pair[ctx][sym] */
+    u32 *pair = (u32*)calloc(256*256, sizeof(u32));
+    for (size_t i = (size_t)k; i < n; i++)
+        pair[(int)data[i-k]*256 + (int)data[i]]++;
+
+    /* Count per-context totals */
+    u32 ctx_total[256] = {0};
+    for (int c = 0; c < 256; c++)
+        for (int s = 0; s < 256; s++)
+            ctx_total[c] += pair[c*256+s];
+
+    /* Normalise global */
+    AnsCtx *gctx = (AnsCtx*)malloc(sizeof(AnsCtx));
+    ans_normalise(global_raw, gctx);
+
+    /* Normalise per-context tables (>= 32 observations) */
+    AnsCtx *pctx[256]; memset(pctx, 0, sizeof(pctx));
+    size_t n_ctx = 0;
+    for (int c = 0; c < 256; c++) {
+        if (ctx_total[c] >= 32) {
+            pctx[c] = (AnsCtx*)malloc(sizeof(AnsCtx));
+            ans_normalise(pair + c*256, pctx[c]);
+            n_ctx++;
+        }
+    }
+    free(pair);
+
+    /* Encode: reverse symbol order, renorm into 'renorm' buffer */
+    Buf renorm = buf_new(n + 16);
+    u64 x = ANS_L;   /* use u64 to avoid overflow during limit computation */
+    for (size_t ii = n; ii-- > 0; ) {
+        u8 s   = data[ii];
+        int c  = (ii >= (size_t)k) ? (int)data[ii-k] : 256; /* 256 = sentinel */
+        AnsCtx *t = (c < 256) ? pctx[c] : NULL;
+        u32 f_s = t ? t->freq[s] : gctx->freq[s];
+        u32 c_s = t ? t->cum[s]  : gctx->cum[s];
+        if (f_s == 0) { f_s = 1; c_s = 0; } /* safety: shouldn't happen */
+        u64 limit = ((u64)ANS_L * ANS_B / ANS_M) * f_s;
+        while (x >= limit) { buf_push(&renorm, (u8)(x & 0xFF)); x >>= 8; }
+        x = (x / f_s) * ANS_M + c_s + (x % f_s);
+    }
+
+    /* Payload = state(4B BE) + renorm_bytes */
+    u8 state_be[4];
+    state_be[0]=(u8)(x>>24); state_be[1]=(u8)(x>>16);
+    state_be[2]=(u8)(x>>8);  state_be[3]=(u8)(x);
+    Buf payload = buf_new(4 + renorm.n);
+    buf_app(&payload, state_be, 4);
+    buf_app(&payload, renorm.d, renorm.n);
+    buf_free(&renorm);
+
+    /* Serialise header */
+    Buf out = buf_new(1 + 4 + 512 + 2 + n_ctx*513 + 4 + payload.n);
+
+    /* k_opt + n */
+    buf_push(&out, (u8)k);
+    { u8 tmp[4]; wr32(tmp, (u32)n); buf_app(&out, tmp, 4); }
+
+    /* Global freq table: 256 × u16 LE */
+    for (int s = 0; s < 256; s++) {
+        buf_push(&out, (u8)(gctx->freq[s] & 0xFF));
+        buf_push(&out, (u8)(gctx->freq[s] >> 8));
+    }
+
+    /* n_ctx (2B BE) */
+    buf_push(&out, (u8)((n_ctx >> 8) & 0xFF));
+    buf_push(&out, (u8)(n_ctx & 0xFF));
+
+    /* Per-context tables */
+    for (int c = 0; c < 256; c++) {
+        if (!pctx[c]) continue;
+        buf_push(&out, (u8)c);
+        for (int s = 0; s < 256; s++) {
+            buf_push(&out, (u8)(pctx[c]->freq[s] & 0xFF));
+            buf_push(&out, (u8)(pctx[c]->freq[s] >> 8));
+        }
+        free(pctx[c]); pctx[c] = NULL;
+    }
+
+    /* payload_len + payload */
+    { u8 tmp[4]; wr32(tmp, (u32)payload.n); buf_app(&out, tmp, 4); }
+    buf_app(&out, payload.d, payload.n);
+    buf_free(&payload);
+    free(gctx);
+    return out;
+}
+
+/*
+ * ANS STRIDE DECODE
+ * -----------------
+ * Inverse of ans_stride_encode.  Returns the original aligned stream.
+ */
+static Buf ans_stride_decode(const u8 *data, size_t dn) {
+    if (dn < 7) { Buf b = buf_new(1); b.n = 0; return b; }
+    size_t pos = 0;
+    int k  = (int)data[pos++];
+    u32 n  = rd32(data + pos); pos += 4;
+
+    if (n == 0) { Buf b = buf_new(1); b.n = 0; return b; }
+
+    /* Read global table (512 bytes = 256 × u16 LE) */
+    u32 graw[256] = {0};
+    for (int s = 0; s < 256; s++) {
+        graw[s] = (u32)data[pos] | ((u32)data[pos+1] << 8); pos += 2;
+    }
+    AnsCtx *gctx = (AnsCtx*)malloc(sizeof(AnsCtx));
+    ans_normalise(graw, gctx);
+
+    /* Read per-context tables */
+    u32 nc_raw = ((u32)data[pos] << 8) | data[pos+1]; pos += 2;
+    AnsCtx *pctx[256]; memset(pctx, 0, sizeof(pctx));
+    for (u32 i = 0; i < nc_raw; i++) {
+        int c = (int)data[pos++];
+        u32 raw[256] = {0};
+        for (int s = 0; s < 256; s++) {
+            raw[s] = (u32)data[pos] | ((u32)data[pos+1] << 8); pos += 2;
+        }
+        pctx[c] = (AnsCtx*)malloc(sizeof(AnsCtx));
+        ans_normalise(raw, pctx[c]);
+    }
+
+    /* Read payload: state(4B BE) + renorm_bytes */
+    u32 plen = rd32(data + pos); pos += 4;
+    if (pos + plen > dn || plen < 4) {
+        /* malformed */
+        free(gctx);
+        for (int c = 0; c < 256; c++) if (pctx[c]) free(pctx[c]);
+        Buf b = buf_new(1); b.n = 0; return b;
+    }
+    const u8 *payload = data + pos;
+
+    /* Initial ANS state (big-endian from first 4 bytes) */
+    u64 x = rd32(payload);
+
+    /* Reversed renorm bytes */
+    size_t rlen = plen - 4;
+    u8 *buf = (u8*)malloc(rlen + 1);
+    for (size_t i = 0; i < rlen; i++) buf[i] = payload[4 + rlen - 1 - i];
+    size_t rpos = 0;
+
+    u8 *out_d = (u8*)malloc(n);
+    for (u32 i = 0; i < n; i++) {
+        int c = (i >= (u32)k) ? (int)out_d[i-k] : 256; /* sentinel */
+        AnsCtx *t = (c < 256) ? pctx[c] : NULL;
+        const u8  *slots = t ? t->slots : gctx->slots;
+        const u16 *freq  = t ? t->freq  : gctx->freq;
+        const u32 *cum   = t ? t->cum   : gctx->cum;
+
+        u32 slot = (u32)(x % ANS_M);
+        u8  s    = slots[slot];
+        out_d[i] = s;
+        x = (u64)freq[s] * (x >> ANS_M_BITS) + slot - cum[s];
+        while (x < ANS_L && rpos < rlen) x = (x << 8) | buf[rpos++];
+    }
+    free(buf);
+    free(gctx);
+    for (int c = 0; c < 256; c++) if (pctx[c]) { free(pctx[c]); pctx[c] = NULL; }
+
+    Buf out; out.d = out_d; out.n = n; out.cap = n;
+    return out;
+}
+
+
 /* ── Flag race ───────────────────────────────────────────────────────────── */
 
 static Buf flag_race(const u32 *fp, size_t fk, size_t n, int *out_fmt) {
@@ -916,11 +1240,10 @@ static Buf flag_race(const u32 *fp, size_t fk, size_t n, int *out_fmt) {
 /* ── Recursive encode ────────────────────────────────────────────────────── */
 /* Level header wire: bit(1) fmt(1) flag_len(4BE) halt(1) child_len(4BE) flag_data */
 
-typedef struct { int bit, fmt; Buf flag_block; } Level;
+typedef struct { int bit, fmt; Buf flag_block; Buf ans_candidate; } Level;
 
 static Buf recursive_encode(const u8 *data, size_t n) {
     if (n==0) {
-        /* Empty: terminal with gzip of empty */
         Buf term = gz_compress(NULL, 0);
         Buf out = buf_new(11 + term.n);
         u8 hdr[11]={0,FMT_GAP,0,0,0,0,HALT_TERMINAL,0,0,0,0};
@@ -932,8 +1255,8 @@ static Buf recursive_encode(const u8 *data, size_t n) {
     Level levels[MAX_DEPTH];
     int   ndepth=0;
 
-    u8 *current    = (u8*)malloc(n);
-    u8 *next_buf   = (u8*)malloc(n);
+    u8 *current  = (u8*)malloc(n);
+    u8 *next_buf = (u8*)malloc(n);
     memcpy(current, data, n);
 
     for (int depth=0; depth<MAX_DEPTH; depth++) {
@@ -947,13 +1270,18 @@ static Buf recursive_encode(const u8 *data, size_t n) {
         Buf fp = bit_clear(current, n, bit, aligned);
         size_t fk = fp.n / sizeof(u32);
 
+        /* v16: compute ANS-stride candidate on aligned stream (pre-remap).
+           This is where inter-symbol value correlations are still intact. */
+        Buf ans_cand = ans_stride_encode(aligned, n);
+
         int fmt;
         Buf flag_block = flag_race((u32*)fp.d, fk, n, &fmt);
         buf_free(&fp);
 
-        levels[ndepth].bit = bit;
-        levels[ndepth].fmt = fmt;
-        levels[ndepth].flag_block = flag_block;
+        levels[ndepth].bit           = bit;
+        levels[ndepth].fmt           = fmt;
+        levels[ndepth].flag_block    = flag_block;
+        levels[ndepth].ans_candidate = ans_cand;
         ndepth++;
 
         remap(aligned, next_buf, n, bit);
@@ -982,20 +1310,47 @@ static Buf recursive_encode(const u8 *data, size_t n) {
     }
     free(current);
 
-    /* Assemble bottom-up */
+    /* Bottom-up assembly with optimal ANS cutoff.
+     *
+     * At each depth (deepest first) compare two costs:
+     *   option_recurse    = len(current payload)     — everything below
+     *   option_ans_stride = 11 + len(ans_candidate)  — halt here with ANS
+     *
+     * Emit HALT_ANS_STRIDE when it is strictly smaller; otherwise HALT_RECURSE.
+     * The first depth where ANS wins becomes the cutoff; all deeper levels were
+     * already folded into 'payload' which gets replaced. */
     Buf payload = inner;
-    for (int i=ndepth-1; i>=0; i--) {
+    for (int i = ndepth-1; i >= 0; i--) {
+        size_t ans_cost     = 11 + levels[i].ans_candidate.n;
+        size_t recurse_cost = payload.n;
+
         u8 hdr[11];
-        hdr[0]=(u8)levels[i].bit; hdr[1]=(u8)levels[i].fmt;
-        wr32(hdr+2,(u32)levels[i].flag_block.n);
-        hdr[6]=HALT_RECURSE;
-        wr32(hdr+7,(u32)payload.n);
-        Buf new_payload = buf_new(11 + levels[i].flag_block.n + payload.n);
-        buf_app(&new_payload, hdr, 11);
-        buf_app(&new_payload, levels[i].flag_block.d, levels[i].flag_block.n);
-        buf_app(&new_payload, payload.d, payload.n);
-        buf_free(&payload); buf_free(&levels[i].flag_block);
-        payload = new_payload;
+        hdr[0] = (u8)levels[i].bit;
+        hdr[1] = (u8)levels[i].fmt;
+        wr32(hdr+2, (u32)levels[i].flag_block.n);
+
+        if (ans_cost < recurse_cost) {
+            /* ANS wins at this depth — discard the subtree below */
+            hdr[6] = HALT_ANS_STRIDE;
+            wr32(hdr+7, (u32)levels[i].ans_candidate.n);
+            buf_free(&payload);
+            Buf np = buf_new(11 + levels[i].flag_block.n + levels[i].ans_candidate.n);
+            buf_app(&np, hdr, 11);
+            buf_app(&np, levels[i].flag_block.d,    levels[i].flag_block.n);
+            buf_app(&np, levels[i].ans_candidate.d, levels[i].ans_candidate.n);
+            payload = np;
+        } else {
+            hdr[6] = HALT_RECURSE;
+            wr32(hdr+7, (u32)payload.n);
+            Buf np = buf_new(11 + levels[i].flag_block.n + payload.n);
+            buf_app(&np, hdr, 11);
+            buf_app(&np, levels[i].flag_block.d, levels[i].flag_block.n);
+            buf_app(&np, payload.d, payload.n);
+            buf_free(&payload);
+            payload = np;
+        }
+        buf_free(&levels[i].flag_block);
+        buf_free(&levels[i].ans_candidate);
     }
     return payload;
 }
@@ -1010,6 +1365,7 @@ static Buf recursive_decode(const u8 *payload, size_t plen, size_t n) {
     DLevel dlevels[MAX_DEPTH]; int ndepth=0;
     size_t pos=0;
     u8 *current=NULL;
+    int ans_terminal=0;   /* 1 if deepest halt was HALT_ANS_STRIDE */
 
     while (pos+11<=plen) {
         int bit   = payload[pos];
@@ -1025,13 +1381,20 @@ static Buf recursive_decode(const u8 *payload, size_t plen, size_t n) {
             dlevels[ndepth].fd=fd;  dlevels[ndepth].fdlen=flen;
             ndepth++;
         } else {
-            const u8 *child = payload+pos; (void)clen;
+            const u8 *child = payload+pos;
             if (halt==HALT_ZERO) {
                 current=(u8*)calloc(n,1);
             } else if (halt==HALT_ONE) {
                 current=(u8*)malloc(n); memset(current,1,n);
+            } else if (halt==HALT_ANS_STRIDE) {
+                /* child is the self-describing ANS-stride payload.
+                   Result is the aligned stream (post-bit-clear, pre-remap).
+                   Do NOT unremap this level during reconstruction. */
+                Buf t = ans_stride_decode(child, (size_t)clen);
+                current=(u8*)malloc(t.n); memcpy(current,t.d,t.n); buf_free(&t);
+                ans_terminal=1;
             } else { /* HALT_TERMINAL */
-                Buf t = term_decode(child, clen);
+                Buf t = term_decode(child, (size_t)clen);
                 current=(u8*)malloc(t.n); memcpy(current,t.d,t.n); buf_free(&t);
             }
             if (flen>0) {
@@ -1045,10 +1408,19 @@ static Buf recursive_decode(const u8 *payload, size_t plen, size_t n) {
 
     if (!current) { current=(u8*)calloc(n,1); }
 
-    /* Rebuild bottom-up */
+    /* Rebuild bottom-up.
+     * For HALT_ANS_STRIDE: the deepest level's `current` is already the aligned
+     * stream (bit-cleared, not remapped), so skip unremap for that level only.
+     * All shallower levels proceed normally: unremap then reconstruct. */
     u8 *tmp = (u8*)malloc(n);
     for (int i=ndepth-1; i>=0; i--) {
-        unremap(current, tmp, n, dlevels[i].bit);
+        int is_ans_level = ans_terminal && (i == ndepth-1);
+        if (is_ans_level) {
+            /* current IS aligned — skip unremap, reconstruct directly */
+            memcpy(tmp, current, n);
+        } else {
+            unremap(current, tmp, n, dlevels[i].bit);
+        }
         Buf fp = decode_fmt(dlevels[i].fd, dlevels[i].fdlen, n, dlevels[i].fmt);
         size_t fk = fp.n/sizeof(u32);
         reconstruct(tmp, (u32*)fp.d, fk, dlevels[i].bit);
@@ -1127,6 +1499,7 @@ static Buf caim_encode(const u8 *data, size_t n) {
 /* ── CAIM decode ─────────────────────────────────────────────────────────── */
 
 static Buf caim_decode(const u8 *payload, size_t plen, size_t n) {
+    (void)plen;
     int n_levels = payload[0];
     const u8 *which_bits = payload+1;
     size_t pos = 1 + n_levels;
@@ -1224,7 +1597,7 @@ static void bench(const u8 *data, size_t n, const char *filename) {
     Buf raw_h = huffman_encode(data, n);
     size_t raw_gz = raw_h.n; buf_free(&raw_h);
 
-    printf("\nAIM v15 Benchmark  --  %zu bytes  (%.2f MiB)\n", n, (double)n/(1024*1024));
+    printf("\nAIM v16 Benchmark  --  %zu bytes  (%.2f MiB)\n", n, (double)n/(1024*1024));
     printf("Input file  : %s\n", filename);
     printf("Raw H0      : %zu bytes  (100.00%%)\n\n", raw_gz);
     printf("%-14s  %12s  %10s  %12s  %8s  %9s  %7s  %3s\n",
@@ -1292,7 +1665,7 @@ static u8 *read_file(const char *path, size_t *out_n) {
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "AIM v15 — Adaptive Isolating Model Compression\n"
+            "AIM v16 — Adaptive Isolating Model Compression\n"
             "Usage:\n"
             "  aim encode <input> <output>\n"
             "  aim decode <input> <output> [--no-verify]\n"

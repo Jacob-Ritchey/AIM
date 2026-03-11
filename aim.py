@@ -1,8 +1,29 @@
 """
-AIM v14  —  Adaptive Isolating Model, clean architecture
+AIM v15  —  Adaptive Isolating Model, clean architecture
 =========================================================
-No backwards compatibility.  No legacy paths.  No ANS.  No block map.
+No backwards compatibility.  No legacy paths.  No block map.
 Fresh implementation of the converged algorithm.
+
+Changes vs v14
+--------------
+New halt condition: HALT_ANS_STRIDE (ID 4).
+
+At each recursive depth, after bit-clear and before remap, the encoder
+computes ANS-stride on the current aligned stream (the 7-bit remapped
+values still carrying inter-symbol value correlations).  After all levels
+are collected, the encoder finds the optimal cutoff: the earliest depth
+at which stopping and encoding the aligned stream with ANS-stride produces
+a smaller output than the sum of all remaining flag blocks plus the terminal.
+
+This captures value-domain correlations (period-k structure in YUV, PCM,
+RGBA, sensor arrays) that the recursive remap progressively dissolves.
+By depth 2-3 those correlations are gone.  HALT_ANS_STRIDE fires before
+that happens when the data supports it.
+
+No domain knowledge is encoded.  The stride k is measured empirically
+from the aligned stream at each depth.  For data with no periodic value
+structure the gain is below STRIDE_GAIN_THRESH and gzip wins the terminal
+race, so the existing path is taken with no overhead.
 
 Architecture
 ------------
@@ -11,64 +32,32 @@ Two full-encode paths compete; the smaller output wins:
   MODE_RECURSIVE  per-level format competition with recursive descent
   MODE_CAIM       all flag bitsets concatenated, single gzip window
 
-Both paths share the same O(n) sweep-and-clear core.
-
-RECURSIVE path
-  Sweep  O(n)  find the bit with fewest set positions
-  Clear  O(n)  zero that bit; record flag positions as bitset
-  Race   O(n)  four format workers run in parallel via scatter-gather,
-               each writing into a pre-allocated result slot
-  Remap  O(n)  pack out the cleared bit; halve the symbol space
-  Halt?        MAX_DEPTH reached, or trivial terminal (all-zero / all-one)
-  Recurse      if not halting, descend on the remapped aligned stream
-  Terminal     gzip(aligned) at halt
-
-  Pipelining: the sweep+remap for level k+1 runs on the main thread
-  while the format workers fill their slots for level k.  Layer
-  boundaries are pipeline stages, not synchronisation barriers.
-
-CAIM path (Concatenated AIM)
-  Same sweep loop but without remap (all 8 bits cleared independently
-  from the original symbol space).  Flag bitsets are accumulated across
-  levels and compressed in one gzip pass, exposing cross-level
-  correlations invisible to per-level compression.
-
-Flag formats (4 compete at each RECURSIVE level):
-  0  gap+gz      gzip of delta-encoded gap list     (arithmetic runs)
-  1  bitset+gz   gzip of raw n/8-byte bitset        (spatial runs)
-  2  EF          Elias-Fano                         (sparse sets)
-  3  RLE         Gamma-coded run lengths            (alternating runs)
+Flag formats (compete at each RECURSIVE level):
+  0  GAP         VLC delta-encoded gap list
+  1  BITSET      raw packed bitset bytes
+  2  EF          Elias-Fano
+  3  RLE         Gamma-coded run lengths
+  4  HUFFMAN     order-0 canonical Huffman on bitset bytes
+  5  LZ77        LZ77 on bitset bytes
+  6  LZ77HUFF    LZ77 + Huffman (= DEFLATE / gzip)
 
 Halt conditions (RECURSIVE):
-  HALT_TERMINAL  gzip(remapped_aligned) stored as leaf
-  HALT_ZERO      aligned stream is all zeros — perfect decomposition
-  HALT_ONE       aligned stream is all ones  — 1-bit floor reached
+  HALT_RECURSE    = 0  continue to next level
+  HALT_TERMINAL   = 1  gzip(aligned) at leaf
+  HALT_ZERO       = 2  aligned is all zeros
+  HALT_ONE        = 3  aligned is all ones
+  HALT_ANS_STRIDE = 4  ANS-stride(aligned) — optimal early cutoff
+
+Wire format: HALT_ANS_STRIDE child payload is the raw _ans_stride_encode()
+output (k embedded in its own wire format).
 
 Container wire format
 ---------------------
   [magic:    4 B]   b"AIM4"
   [mode:     1 B]   0=recursive  1=caim
-  [orig_n:   8 B]   uint64 BE — original byte count
+  [orig_n:   8 B]   uint64 BE
   [sha256:  32 B]   SHA-256 of original data
   [payload:  …  ]   depends on mode
-
-Recursive payload (self-describing, depth-first):
-  Per level:
-    [bit:      1 B]   which bit was cleared (0-7)
-    [fmt:      1 B]   flag format used (0-3)
-    [flag_len: 4 B]   uint32 BE
-    [flag_data:N B]
-    [halt:     1 B]   0=recurse  1=terminal  2=zero  3=one
-    [child_len:4 B]   uint32 BE  (0 when halt=zero or halt=one)
-    [child:    N B]   recursive payload  OR  gzip(aligned)
-
-CAIM payload:
-  [n_levels: 1 B]
-  [bits:     n_levels B]   which bit cleared at each level
-  [flags_len:4 B]   uint32 BE
-  [flags_gz: N B]   gzip(concat of all flag bitsets)
-  [term_len: 4 B]   uint32 BE
-  [term_gz:  N B]   gzip(final aligned stream)
 """
 
 from __future__ import annotations
@@ -122,15 +111,27 @@ FMT_NAMES    = {0:"gap", 1:"bitset", 2:"EF", 3:"RLE",
                 4:"huffman", 5:"lz77", 6:"lz77+huff"}
 
 HALT_RECURSE  = 0
-HALT_TERMINAL = 1           # leaf: huffman(aligned)
+HALT_TERMINAL = 1           # leaf: gzip(aligned)
 HALT_ZERO     = 2           # leaf: aligned is all zeros
 HALT_ONE      = 3           # leaf: aligned is all ones
+HALT_ANS_STRIDE = 4         # leaf: ANS-stride(aligned) — optimal early cutoff
 
-MAX_DEPTH      = 8          # one level per bit in a byte symbol
-BITSET_THRESH  = 0.40       # density above which gap list is not built
-PARALLEL_MIN   = 512 * 1024 # bytes threshold before spawning threads
-EF_MAX_DENSITY  = 0.15      # skip EF above this — materialising positions is too slow
-GAP_MAX_DENSITY = 0.30      # skip GAP above this — gap list beats nothing at high density
+MAX_DEPTH      = 8
+BITSET_THRESH  = 0.40
+PARALLEL_MIN   = 512 * 1024
+EF_MAX_DENSITY  = 0.15
+GAP_MAX_DENSITY = 0.30
+
+# ── rANS constants ────────────────────────────────────────────────────────────
+_ANS_M_BITS = 14
+_ANS_M      = 1 << _ANS_M_BITS   # 16384
+_ANS_L      = _ANS_M
+_ANS_B      = 256
+
+# ── Stride sweep ──────────────────────────────────────────────────────────────
+_STRIDE_CANDIDATES  = [1, 2, 3, 4, 6, 8, 12, 16]
+_STRIDE_SAMPLE      = 1_000_000  # bytes of aligned stream to probe
+_STRIDE_GAIN_THRESH = 0.05       # bits/sym gain over k=1 required to activate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -616,11 +617,198 @@ def _build_bitset_bytes(flag_pos, n: int) -> bytes:
 
 
 
-def _term_encode(data: bytes) -> bytes:
-    """Terminal codec: LZ77 for repeated-structure removal, then Huffman for entropy.
-    Used for: recursive halt terminals, CAIM flag concatenation, CAIM final stream."""
+# ─────────────────────────────────────────────────────────────────────────────
+# rANS ORDER-1 STRIDE-k  (aligned-stream halt codec)
+# ─────────────────────────────────────────────────────────────────────────────
+# Applied to the aligned stream (post-bit-clear, pre-remap) where inter-symbol
+# value correlations are strongest.  Context: aligned[i - k].
+# Wire: k(1B) + n(4B BE) + n_ctx(2B BE) +
+#       n_ctx × [ ctx_byte(1B) + freq[256 × uint16 LE] ] +
+#       payload_len(4B BE) + payload
+
+def _ans_conditional_entropy(data: bytes, k: int) -> float:
+    """H(X_i | X_{i-k}).  Lower = stronger value correlation at stride k."""
+    n = len(data)
+    if n <= k:
+        return 8.0
+    if _HAS_NUMPY and n > 4096:
+        arr      = np.frombuffer(data, dtype=np.uint8).astype(np.int32)
+        ctx      = arr[:-k]; sym = arr[k:]
+        keys     = ctx * 256 + sym
+        pair_cnt = np.bincount(keys, minlength=256 * 256)
+        ctx_cnt  = np.bincount(ctx,  minlength=256)
+        total    = float(n - k)
+        nz       = np.flatnonzero(pair_cnt)
+        H = 0.0
+        for key in nz:
+            c_idx = int(key) // 256
+            cnt   = int(pair_cnt[key])
+            H    -= (cnt / total) * math.log2(cnt / float(ctx_cnt[c_idx]))
+        return H
+    pair: dict = {}; ctx_c: dict = {}
+    for i in range(k, n):
+        c = data[i - k]; s = data[i]
+        pair[(c, s)] = pair.get((c, s), 0) + 1
+        ctx_c[c]     = ctx_c.get(c, 0) + 1
+    total = n - k; H = 0.0
+    for (c, s), cnt in pair.items():
+        H -= (cnt / total) * math.log2(cnt / ctx_c[c])
+    return H
+
+
+def _ans_select_stride(data: bytes) -> int:
+    """Return k_opt = argmin H(X_i | X_{i-k}).
+    Falls back to k=1 if gain over k=1 is below _STRIDE_GAIN_THRESH."""
+    probe  = data[:_STRIDE_SAMPLE] if len(data) > _STRIDE_SAMPLE else data
+    scores = {k: _ans_conditional_entropy(probe, k) for k in _STRIDE_CANDIDATES}
+    k_opt  = min(scores, key=lambda k: scores[k])
+    if scores[1] - scores[k_opt] < _STRIDE_GAIN_THRESH:
+        k_opt = 1
+    return k_opt
+
+
+def _ans_normalise(raw: dict) -> Tuple[dict, dict, list]:
+    """Normalise raw symbol counts to sum exactly _ANS_M.
+    Returns (freq, cum, slots)."""
+    freq = {s: max(1, round(cnt * _ANS_M / max(sum(raw.values()), 1)))
+            for s, cnt in raw.items() if cnt > 0}
+    delta = _ANS_M - sum(freq.values())
+    keys  = sorted(freq, key=lambda x: -freq[x])
+    i = 0
+    while delta != 0:
+        s = keys[i % len(keys)]
+        if delta > 0:
+            freq[s] += 1; delta -= 1
+        elif freq[s] > 1:
+            freq[s] -= 1; delta += 1
+        i += 1
+    cum: dict = {}; acc = 0
+    for s in range(256):
+        cum[s] = acc; acc += freq.get(s, 0)
+    slots = [0] * _ANS_M
+    for s, f in freq.items():
+        for j in range(f):
+            slots[cum[s] + j] = s
+    return freq, cum, slots
+
+
+def _ans_stride_encode(data: bytes) -> bytes:
+    """Encode aligned stream with stride-k order-1 rANS.
+
+    Emit renorm bytes LSB-first, then 4-byte state LSB-first.
+    Decode reverses the stream and reads forward (v7p2 pattern).
+
+    Wire: k(1B) + n(4B BE) + n_ctx(2B BE) +
+          n_ctx × [ ctx_byte(1B) + freq[256 × uint16 LE] ] +
+          payload_len(4B BE) + payload
+    """
     if not data:
-        return _huffman_encode(b"")
+        return struct.pack(">BIH", 1, 0, 0) + struct.pack(">I", 0)
+
+    from collections import Counter, defaultdict
+    n     = len(data)
+    k_opt = _ans_select_stride(data)
+
+    global_raw = Counter(data)
+    gf, gc, _g = _ans_normalise(dict(global_raw))
+
+    ctx_raw: dict = defaultdict(Counter)
+    for i in range(k_opt, n):
+        ctx_raw[data[i - k_opt]][data[i]] += 1
+
+    ctx_tables: dict = {}
+    for ctx_byte, cnts in ctx_raw.items():
+        if sum(cnts.values()) >= 32:
+            ctx_tables[ctx_byte] = _ans_normalise(dict(cnts))
+
+    # Encode: reverse symbol order, emit renorm bytes LSB-first into out
+    # Sentinel ctx=256 for positions where i < k_opt (never in ctx_tables).
+    out = bytearray()
+    x   = _ANS_L
+    for i in range(n - 1, -1, -1):
+        s     = data[i]
+        ctx   = data[i - k_opt] if i >= k_opt else 256
+        t     = ctx_tables.get(ctx)
+        f_s   = t[0].get(s, 1) if t else gf.get(s, 1)
+        c_s   = t[1].get(s, 0) if t else gc.get(s, 0)
+        limit = ((_ANS_L * _ANS_B) // _ANS_M) * f_s
+        while x >= limit:
+            out.append(x & 0xFF); x >>= 8
+        x = (x // f_s) * _ANS_M + c_s + (x % f_s)
+    # Wire: state(4B BE) + renorm_bytes (decode reverses renorm_bytes)
+    payload = struct.pack(">I", x) + bytes(out)
+
+    # Wire: global table (fixed 512 bytes) then per-context tables.
+    # Global is stored separately to avoid collision with ctx_byte=255.
+    global_wire = bytearray()
+    for s in range(256):
+        global_wire += struct.pack("<H", gf.get(s, 0))
+
+    ctx_wire = bytearray()
+    ctx_wire += struct.pack(">H", len(ctx_tables))
+    for cb, (cf, _, _2) in ctx_tables.items():
+        ctx_wire.append(cb)
+        for s in range(256):
+            ctx_wire += struct.pack("<H", cf.get(s, 0))
+
+    return (struct.pack(">BI", k_opt, n) +
+            bytes(global_wire) +
+            bytes(ctx_wire) +
+            struct.pack(">I", len(payload)) + payload)
+
+
+def _ans_stride_decode(data: bytes) -> bytes:
+    """Decode payload from _ans_stride_encode."""
+    k_opt, n = struct.unpack_from(">BI", data, 0)
+    if n == 0:
+        return b""
+    pos = 5
+    # Read global table (fixed 512 bytes)
+    raw_g = {}
+    for s in range(256):
+        v, = struct.unpack_from("<H", data, pos); pos += 2
+        if v: raw_g[s] = v
+    global_freq, global_cum, global_slots = _ans_normalise(raw_g)
+
+    # Read per-context tables
+    n_ctx, = struct.unpack_from(">H", data, pos); pos += 2
+    ctx_tables: dict = {}
+    for _ in range(n_ctx):
+        ctx_byte = data[pos]; pos += 1
+        raw = {}
+        for s in range(256):
+            v, = struct.unpack_from("<H", data, pos); pos += 2
+            if v: raw[s] = v
+        ctx_tables[ctx_byte] = _ans_normalise(raw)
+
+    plen, = struct.unpack_from(">I", data, pos); pos += 4
+    payload = data[pos: pos + plen]
+
+    # State is first 4 bytes (big-endian); renorm bytes follow reversed
+    x,   = struct.unpack_from(">I", payload, 0)
+    buf  = payload[4:][::-1]
+    rpos = 0
+
+    out = bytearray(n)
+    for i in range(n):
+        ctx   = out[i - k_opt] if i >= k_opt else 256
+        t     = ctx_tables.get(ctx)
+        slots = t[2] if t else global_slots
+        freq  = t[0] if t else global_freq
+        cum   = t[1] if t else global_cum
+        slot  = x % _ANS_M
+        s     = slots[slot]
+        out[i] = s
+        x = freq[s] * (x >> _ANS_M_BITS) + slot - cum[s]
+        while x < _ANS_L and rpos < len(buf):
+            x = (x << 8) | buf[rpos]; rpos += 1
+    return bytes(out)
+
+
+def _term_encode(data: bytes) -> bytes:
+    """Terminal codec for CAIM and recursive leaf nodes."""
+    if not data:
+        return gzip.compress(b"", 9)
     return gzip.compress(data, 9)
 
 def _term_decode(payload: bytes) -> bytes:
@@ -756,10 +944,11 @@ def _recursive_encode(data: bytes) -> bytes:
         bit(1) fmt(1) flag_len(4) halt(1) child_len(4)  flag_data[flag_len]
 
     halt values:
-        HALT_RECURSE  = 0   child is the next level header
-        HALT_TERMINAL = 1   child is gzip(remapped stream), level has valid flags
-        HALT_ZERO     = 2   input was all zeros, no child
-        HALT_ONE      = 3   input was all ones,  no child
+        HALT_RECURSE    = 0   child is the next level header
+        HALT_TERMINAL   = 1   child is gzip(aligned), level has valid flags
+        HALT_ZERO       = 2   input was all zeros, no child
+        HALT_ONE        = 3   input was all ones,  no child
+        HALT_ANS_STRIDE = 4   child is ANS-stride(aligned) — optimal early cutoff
     """
     n = len(data)
 
@@ -767,13 +956,17 @@ def _recursive_encode(data: bytes) -> bytes:
         terminal = gzip.compress(b"", 9)
         return struct.pack(">BBIBI", 0, FMT_GAP, 0, HALT_TERMINAL, len(terminal)) + terminal
 
-    # ── Iterative descent: collect one (bit, fmt, flag_block) per level ──
-    levels: List[Tuple[int, int, bytes]] = []
-    current  = data
+    # ── Iterative descent ─────────────────────────────────────────────────────
+    # Each level stores: (best_bit, best_fmt, flag_block, ans_candidate)
+    # ans_candidate = ANS-stride encoding of aligned at this depth.
+    # We keep aligned alive just long enough to compute the ANS candidate,
+    # then delete it before allocating the next level's aligned.
+    levels: List[Tuple[int, int, bytes, bytes]] = []
+    current = data
     del data
 
     for depth in range(MAX_DEPTH):
-        mb = 7 - depth   # effective max bit shrinks as symbol space halves
+        mb = 7 - depth
 
         if mb < 0:
             break
@@ -781,7 +974,6 @@ def _recursive_encode(data: bytes) -> bytes:
             break
 
         best_bit = _sweep(current, mb)
-
         aligned, flag_pos = _bit_clear(current, best_bit)
 
         if isinstance(flag_pos, _BitsetSentinel):
@@ -791,6 +983,9 @@ def _recursive_encode(data: bytes) -> bytes:
         else:
             k = len(flag_pos)
         density = k / len(current) if current else 0.0
+
+        # ANS-stride candidate on aligned stream (before remap dissolves correlations)
+        ans_candidate = _ans_stride_encode(aligned)
 
         remapped = _remap(aligned, best_bit)
         del aligned
@@ -814,26 +1009,52 @@ def _recursive_encode(data: bytes) -> bytes:
         flag_block = fmt_results[best_fmt]
         del fmt_results
 
-        levels.append((best_bit, best_fmt, flag_block))
+        levels.append((best_bit, best_fmt, flag_block, ans_candidate))
 
         current = remapped
         del remapped
 
+    # ── Terminal ──────────────────────────────────────────────────────────────
     if _is_all_zero(current):
         inner = struct.pack(">BBIBI", 0, FMT_GAP, 0, HALT_ZERO, 0)
+        terminal_size = 11
     elif _is_all_one(current):
         inner = struct.pack(">BBIBI", 0, FMT_GAP, 0, HALT_ONE, 0)
+        terminal_size = 11
     else:
         gz_cur = _term_encode(current)
         inner  = struct.pack(">BBIBI", 0, FMT_GAP, 0, HALT_TERMINAL, len(gz_cur)) + gz_cur
+        terminal_size = 11 + len(gz_cur)
     del current
 
-    # ── Assemble bottom-up ────────────────────────────────────────────────
+    # ── Find optimal ANS cutoff ───────────────────────────────────────────────
+    # Scan from deepest to shallowest.  At each depth d, the "remaining cost"
+    # if we continue recursing is: sum(flag_blocks[d+1:]) + terminal + headers.
+    # The ANS cutoff cost is: len(ans_candidate[d]) + header(11B).
+    # Replace the subtree at depth d with HALT_ANS_STRIDE if it's smaller.
+    #
+    # We assemble bottom-up so we know exact remaining payload size at each step.
+
     payload = inner
-    for best_bit, best_fmt, flag_block in reversed(levels):
-        hdr     = struct.pack(">BBIBI", best_bit, best_fmt,
-                              len(flag_block), HALT_RECURSE, len(payload))
-        payload = hdr + flag_block + payload
+
+    for depth in range(len(levels) - 1, -1, -1):
+        best_bit, best_fmt, flag_block, ans_candidate = levels[depth]
+
+        # Cost of current subtree (everything below this level including terminal)
+        subtree_cost = len(payload)
+
+        # Cost of halting here with ANS-stride instead
+        ans_cost = 11 + len(ans_candidate)  # header + ans payload
+
+        if ans_cost < subtree_cost:
+            # ANS-stride wins: emit this level's flags then HALT_ANS_STRIDE
+            hdr     = struct.pack(">BBIBI", best_bit, best_fmt,
+                                  len(flag_block), HALT_ANS_STRIDE, len(ans_candidate))
+            payload = hdr + flag_block + ans_candidate
+        else:
+            hdr     = struct.pack(">BBIBI", best_bit, best_fmt,
+                                  len(flag_block), HALT_RECURSE, len(payload))
+            payload = hdr + flag_block + payload
 
     return payload
 
@@ -849,6 +1070,7 @@ def _recursive_decode(payload: bytes, n: int) -> bytes:
 
     levels = []   # list of (bit, fmt, flag_data)
     pos    = 0
+    ans_terminal = False   # True when deepest halt was HALT_ANS_STRIDE
 
     while True:
         best_bit  = payload[pos]
@@ -861,19 +1083,19 @@ def _recursive_decode(payload: bytes, n: int) -> bytes:
 
         if halt == HALT_RECURSE:
             levels.append((best_bit, fm, flag_data))
-            # pos now points to the child level header; continue walking
 
         else:
-            # Terminal: HALT_ZERO, HALT_ONE, or HALT_TERMINAL.
-            # flag_len==0 means this is a "pure" terminal with no
-            # flags to apply; flag_len>0 means this level also has
-            # flags (from a cake halt where we stop mid-recursion).
             child = bytes(payload[pos: pos + child_len])
 
             if halt == HALT_ZERO:
                 current = bytes(n)
             elif halt == HALT_ONE:
                 current = bytes([1] * n)
+            elif halt == HALT_ANS_STRIDE:
+                # current is the aligned stream (post-bit-clear, pre-remap)
+                # the terminal level's flags still need to be applied
+                current = _ans_stride_decode(child)
+                ans_terminal = True
             else:  # HALT_TERMINAL
                 current = _term_decode(child)
 
@@ -881,9 +1103,16 @@ def _recursive_decode(payload: bytes, n: int) -> bytes:
                 levels.append((best_bit, fm, flag_data))
             break
 
-    # Rebuild bottom-up: unremap then restore flags for each level
-    for best_bit, fm, flag_data in reversed(levels):
-        aligned  = _unremap(current, best_bit)
+    # Rebuild bottom-up.
+    # For HALT_ANS_STRIDE the deepest level's current is already `aligned`
+    # (bit-cleared but not remapped), so we skip _unremap for that one level.
+    for i, (best_bit, fm, flag_data) in enumerate(reversed(levels)):
+        is_ans_level = ans_terminal and (i == 0)
+        if is_ans_level:
+            # current IS aligned — skip unremap, go straight to reconstruct
+            aligned = current
+        else:
+            aligned = _unremap(current, best_bit)
         flag_pos = _decode_fmt(flag_data, n, fm)
         current  = _reconstruct(aligned, flag_pos, best_bit)
         del aligned, flag_pos
