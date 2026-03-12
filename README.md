@@ -40,7 +40,7 @@ The algorithm is **parameter-free**: every decision — which bit, which codec, 
 ## Build
 
 ```bash
-gcc -O3 -o aim aim_v16.c -lz -lm
+gcc -O3 -o aim aim.c -lz -lm
 ```
 
 Single file. Only dependency: zlib.
