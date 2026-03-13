@@ -53,6 +53,9 @@ Single file. Only dependency: zlib.
 # Encode
 ./aim encode input.bin output.aim
 
+# Encode large file with bounded memory
+./aim encode input.bin output.aim --disk
+
 # Decode (SHA-256 verified)
 ./aim decode output.aim recovered.bin
 
@@ -130,11 +133,10 @@ At each depth, 7 codecs compete for the flag set. The shortest wins:
 
 ## Implementations
 
-| File     | Description                                                                                 |
-| -------- | ------------------------------------------------------------------------------------------- |
-| `aim.c`  | C reference. Single file. `gcc -O3 -o aim aim.c -lz -lm`. Zero warnings at `-Wall -Wextra`. |
-| `aim.py` | Python reference. Standard library + NumPy + zlib.                                          |
-
+| File | Description |
+| --- | --- |
+| `aim_v33.c` | C reference. Single file. `gcc -O3 -o aim aim_v33.c -lz -lm`. Zero warnings at `-Wall -Wextra`. Disk mode with bounded memory. |
+| `aim_v15.py` | Python reference (older). Standard library + NumPy + zlib. Wire-compatible with v16. |
 Both are wire-compatible. Files encoded by either implementation decode correctly with the other. All outputs are SHA-256 verified.
 
 Python is the readable reference. C is ~29× faster on large files (8.7s vs 252s on the 38.7 MB WAV).
@@ -168,6 +170,36 @@ Huffman coding formalised the optimal parameter-free algorithm for symbol-freque
 The core AIM operations — bit-plane sweep, bit-clear, remap, and the rANS encode/decode loop — are branchless, fixed-depth, and operate on independent byte elements, making them amenable to SIMD vectorisation. Existing AVX-512 primitives (VGATHER, VPERMB, VPSHUFB) cover the stride-gather and remap patterns directly. A SIMD-accelerated C implementation and formal throughput analysis are left for future work.
 
 ---
+## Stability and Compatibility
+
+> **This is a research toolkit in active development. It is not an archival format or a production codec.**
+
+### What this means in practice
+
+**Wire format stability:** The AIM4 wire format is documented in `AIM_Specification` and has been stable since v16. Files encoded with v16 decode correctly with v16-compatible decoders. However, format revisions may occur as the algorithm develops. **Do not use AIM as an archival format for data you cannot recover from the original source.**
+
+**Implementation stability:** The C implementation (`aim_v33.c` as of this writing) is iterative research code. Memory behaviour, performance characteristics, and edge-case handling are actively improving. Breaking changes may occur between versions without deprecation notice.
+
+**Memory safety:** The `--disk` mode encoder has been extensively profiled and corrected through v25–v33 to bound peak RAM usage to approximately 2× the input file size. However, residual edge cases may exist. Monitor system memory during encoding of large files and ensure adequate free RAM before starting.
+
+**Correctness verification:** Every encode/decode roundtrip is SHA-256 verified by the decoder. If the decoder reports a hash mismatch, the output is corrupt and should be discarded. Never trust an AIM-encoded file without running the decoder to verify it.
+
+**Large file behaviour:** Files over 4 GB require v25 or later for correct decoding. Earlier versions contain an integer overflow in the decode path that silently truncates data beyond 4 GB.
+
+### What this is good for right now
+
+- Compression research and experimentation
+- Evaluating bit-plane and inter-symbol structure in your data
+- Academic and exploratory use where the source file is always retained
+- Understanding the structural properties of binary formats (PCM, YUV, GGUF, etc.)
+
+### What to use instead for archival or production use
+
+If you need guaranteed long-term format stability, use a mature standard: `gzip`, `zstd`, `bzip2`, `xz`. AIM may eventually outperform them on specific data classes, but that is a research question, not a settled result.
+
+---
+
+---
 
 ## Intent
 
@@ -179,9 +211,9 @@ The author explicitly does not endorse its use in mass surveillance systems, aut
 
 ## License
 
-Code (`aim.c`, `aim.py`): [MIT License](LICENSE)
+Code: [MIT License](LICENSE)
 
-Paper and specification: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+Paper and Specification: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
 
 © 2026 Jacob Ritchey
 
