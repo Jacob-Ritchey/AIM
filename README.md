@@ -17,7 +17,7 @@ Encoded  'DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf'  (5027782720 bytes)
   Mode     : c-aim
   Output   : 614653775 bytes  (12.23%)
   Raw H0   : 5027782980 bytes  (100.00%)
-  Delta    : -4413129205 bytes  (-87.77%)
+  Delta    : -4413129205 bytes  (-87.77% vs gzip)
   Written  : 'DeepSeekr1.aim'  [920.12s]
 
 4.7 GB DeepSeek R1 GGUF → 586 MB, −87.77%, lossless, SHA-256 verified"
