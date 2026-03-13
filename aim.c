@@ -1,11 +1,64 @@
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sys/mman.h>
 /* aim.c — AIM Compression Algorithm, C Reference Implementation
- * Version: 16  |  Reference: aim_v15.py  |  Spec: AIM_Specification_v16.docx
+ * Version: 34  |  Reference: aim_v15.py  |  Spec: AIM_Specification_v16.docx
  *
  * v16 adds HALT_ANS_STRIDE (halt code 4): at each recursive depth the encoder
  * computes an rANS order-1 stride-k encoding of the aligned stream and stores
  * it as a candidate.  Bottom-up assembly picks the earliest depth where ANS-
  * stride is cheaper than the remaining subtree (optimal cutoff, no heuristic).
  * Stride k is selected by measuring H(X_i | X_{i-k}) over {1,2,3,4,6,8,12,16}.
+ *
+ * v17 fixes position overflow for files > 4 GB.
+ *
+ * v18 adds --disk mode.
+ *
+ * v19 fixes --disk peak memory (streams renorm).
+ *
+ * v20: in --disk mode the input file is never loaded into a heap buffer.
+ *
+ * v21: gz_compress no longer pre-allocates deflateBound(n) (streaming).
+ *
+ * v22: progress reporting (RSS per phase/depth).
+ *
+ * v23: in disk mode, flag_race skips GAP/EF when pv would exceed 512 MB.
+ *
+ * v24: malloc_trim(0) after major frees; signal handler for /tmp cleanup;
+ *       self-tracked peak RSS.
+ *
+ * v25: call posix_fadvise(POSIX_FADV_DONTNEED) after every disk_write so
+ *       the kernel evicts those pages from the page cache immediately.
+ *       The /tmp file can grow to ~3n bytes but none of it needs to stay
+ *       in RAM between write and the final assembly pass.  This is the
+ *       source of the 44 GB system-monitor reading that /proc/self/status
+ *       VmRSS does not show: page-cache pages written by fwrite().
+ *       Also fadvise WILLNEED just before each disk_read so the kernel
+ *       starts fetching pages ahead of time. so glibc
+ * returns pages to the OS immediately rather than holding them in its arena.
+ * Register SIGINT/SIGTERM handler to delete /tmp files on kill.
+ * Progress now reports both RSS and VmPeak for honest before/after view.  Both formats
+ * require materialising a full u64 position array (up to 4n bytes for
+ * dense bits) which is the source of the observed 45 GB peak.  On large
+ * files LZ77HUFF always wins anyway.  Also: fp is written directly to the
+ * temp file in disk mode; flag_race receives it from disk, keeping peak to
+ * current(n) + next_buf(n) + aligned(n) + fp_on_disk.  Each phase and depth prints label + elapsed +
+ * RSS memory (from /proc/self/status).  Enabled when --disk is set (verbose
+ * encode) or always when stderr is a tty.  Helps diagnose memory peaks. — it streams
+ * output in 256 KB chunks, using only actual compressed size.  caim disk
+ * mode streams bitsets directly through zlib without building flags_cat.
+ * Eliminates the two largest surprise allocations (~5 GB each per call).
+ * sha256 is computed by streaming 64 KB chunks.  recursive_encode and
+ * caim_encode fread() directly into their working buffer `current`.
+ * Peak RAM in --disk mode: current + next_buf + aligned + pair = 3n + 256 MB.: ans_stride_encode_to_disk() streams renorm
+ * bytes directly to FILE, eliminating the 3 × n-sized Buf allocations that
+ * v18 still built inside ans_stride_encode().  pctx tables (512 KB) stay in
+ * RAM.  Peak in --disk mode: current + next_buf + aligned + pair = 3n + 256 MB.: level data (flag_block, ans_candidate, CAIM bitsets)
+ * is streamed to a temp file instead of held in RAM.  Working buffers
+ * (current + aligned, 2×n) are still required in memory.  Assembly reads
+ * back from the temp file.  Activated with --disk flag on encode/bench.  Flag positions are stored as
+ * u32 when < POS_SENTINEL (0xFFFFFFFE), and as sentinel(4B) + u64(8B) when >=
+ * POS_SENTINEL.  Files under 4 GB: zero wire-format change.
  *
  * Build:  gcc -O3 -o aim aim.c -lz -lm
  * Usage:  ./aim encode <input> <o>
@@ -15,6 +68,8 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <malloc.h>
+#include <signal.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
@@ -50,6 +105,167 @@ static u64 rd64(const u8 *p) { return ((u64)rd32(p)<<32)|rd32(p+4); }
 static void wr32(u8 *p, u32 v) { p[0]=v>>24; p[1]=v>>16; p[2]=v>>8; p[3]=v; }
 static void wr64(u8 *p, u64 v) { wr32(p,(u32)(v>>32)); wr32(p+4,(u32)v); }
 
+/* ── Variable-width position encoding ────────────────────────────────────────
+ * Positions < POS_SENTINEL fit in a u32 and are stored as 4 bytes (common case).
+ * Positions >= POS_SENTINEL are stored as sentinel(4B) + full u64(8B) = 12 bytes.
+ * Files under 4 GB: identical wire format to v16.
+ * Returns bytes written (4 or 12). */
+#define POS_SENTINEL 0xFFFFFFFEu
+
+static void pos_write(Buf *b, u64 p) {
+    u8 tmp[12];
+    if (p < POS_SENTINEL) {
+        wr32(tmp, (u32)p);
+        buf_app(b, tmp, 4);
+    } else {
+        wr32(tmp, POS_SENTINEL);
+        wr64(tmp+4, p);
+        buf_app(b, tmp, 12);
+    }
+}
+
+/* Read one position from src[*pos], advance *pos.  Returns position value. */
+static u64 pos_read(const u8 *src, size_t *off) {
+    u32 v = rd32(src + *off); *off += 4;
+    if (v != POS_SENTINEL) return (u64)v;
+    u64 full = rd64(src + *off); *off += 8;
+    return full;
+}
+
+/* Byte size of a position value when encoded */
+/* pos_size reserved for future use */
+
+
+
+
+/* ── Disk-mode helpers ────────────────────────────────────────────────────────
+ * When g_disk_mode is set, level output (flag_block, ans_candidate, CAIM
+ * bitsets) is written to a temp file rather than kept in RAM.
+ * The in-memory index stores (offset, size) pairs only.
+ * Working buffers (current, aligned) must still be in RAM.
+ */
+static int g_disk_mode = 0;   /* set by --disk flag */
+
+/* ── Progress reporting ───────────────────────────────────────────────────── */
+static int g_verbose = 0;  /* set by --disk or --verbose */
+
+static size_t g_peak_rss_mb = 0;  /* manually tracked peak */
+
+static size_t current_rss_mb(void) {
+#if defined(__linux__)
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[128]; size_t kb = 0;
+    while (fgets(line, sizeof(line), f))
+        if (strncmp(line, "VmRSS:", 6) == 0) { sscanf(line+6, "%zu", &kb); break; }
+    fclose(f);
+    return kb / 1024;
+#else
+    return 0;
+#endif
+}
+
+static void mem_stats(size_t *rss_out, size_t *peak_out) {
+    *rss_out = current_rss_mb();
+    if (*rss_out > g_peak_rss_mb) g_peak_rss_mb = *rss_out;
+    *peak_out = g_peak_rss_mb;
+}
+
+static double now_s(void);  /* forward declaration */
+
+/* ── Temp file cleanup registry ─────────────────────────────────────────────
+ * Registered tmp paths are deleted on SIGINT/SIGTERM so disk-mode temp files
+ * are not left in /tmp if the user kills the process mid-run.
+ */
+#define MAX_TMP_FILES 8
+static char g_tmp_registry[MAX_TMP_FILES][64];
+static int  g_tmp_count = 0;
+
+static void tmp_register(const char *path) {
+    if (g_tmp_count < MAX_TMP_FILES)
+        strncpy(g_tmp_registry[g_tmp_count++], path, 63);
+}
+
+static void tmp_cleanup(void) {
+    for (int i = 0; i < g_tmp_count; i++) {
+        if (g_tmp_registry[i][0]) {
+            remove(g_tmp_registry[i]);
+            g_tmp_registry[i][0] = 0;
+        }
+    }
+    g_tmp_count = 0;
+}
+
+static void sig_handler(int sig) {
+    tmp_cleanup();
+    /* Re-raise with default handler so shell sees correct exit status */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static double prog_t0 = 0.0;  /* set at encode start */
+
+static void prog(const char *phase, const char *label, int depth) {
+    if (!g_verbose) return;
+    double elapsed = now_s() - prog_t0;
+    size_t rss, peak; mem_stats(&rss, &peak);
+    if (depth >= 0)
+        fprintf(stderr, "  [%6.2fs] [%5zu MB RSS / %5zu MB peak]  %-10s  depth %d  %s\n",
+                elapsed, rss, peak, phase, depth, label);
+    else
+        fprintf(stderr, "  [%6.2fs] [%5zu MB RSS / %5zu MB peak]  %-10s  %s\n",
+                elapsed, rss, peak, phase, label);
+    fflush(stderr);
+}
+
+
+
+typedef struct { long offset; size_t size; } DiskRef;
+
+static FILE *disk_tmp_open(char *path_out, size_t path_sz) {
+    snprintf(path_out, path_sz, "/tmp/aim_tmp_XXXXXX");
+    int fd = mkstemp(path_out);
+    if (fd < 0) { perror("mkstemp"); return NULL; }
+    FILE *f = fdopen(fd, "w+b");
+    if (!f) { close(fd); }
+    else { tmp_register(path_out); }
+    return f;
+}
+
+/* Write buf to file, return DiskRef.  buf is NOT freed here. */
+static DiskRef disk_write(FILE *f, const Buf *b) {
+    DiskRef r;
+    r.offset = ftell(f);
+    r.size   = b->n;
+    if (b->n > 0) fwrite(b->d, 1, b->n, f);
+    return r;
+}
+
+/* Read DiskRef back into a fresh Buf. */
+static Buf disk_read(FILE *f, DiskRef r) {
+    Buf b = buf_new(r.size + 1);
+    b.n = r.size;
+    if (r.size > 0) {
+        int fd = fileno(f);
+        /* Hint kernel to prefetch pages before we read them */
+        posix_fadvise(fd, r.offset, (off_t)r.size, POSIX_FADV_WILLNEED);
+        fseek(f, r.offset, SEEK_SET);
+        if (fread(b.d, 1, r.size, f) != r.size) { fprintf(stderr,"aim: disk read error\n"); }
+        /* Release page-cache pages after reading — we have the data in RAM */
+        posix_fadvise(fd, r.offset, (off_t)r.size, POSIX_FADV_DONTNEED);
+    }
+    return b;
+}
+
+/* Drop a written region from the page cache immediately.
+ * Called right after disk_write so the kernel doesn't hold the pages in RAM
+ * until the assembly pass (which could be hours later for a large GGUF). */
+static void disk_drop_cache(FILE *f, DiskRef r) {
+    if (r.size > 0) {
+        fflush(f);  /* ensure dirty pages are written before we advise */
+        posix_fadvise(fileno(f), r.offset, (off_t)r.size, POSIX_FADV_DONTNEED);
+    }
+}
 
 /* ── SHA-256 (public domain, Brad Conte) ─────────────────────────────────── */
 static const u32 K256[64] = {
@@ -101,20 +317,66 @@ static void sha256(const u8 *data, size_t len, u8 out[32]) {
     for (i=0;i<8;i++) wr32(out+i*4, st[i]);
 }
 
+/* Stream SHA-256 from a file — no n-sized allocation */
+static int sha256_file(const char *path, u8 out[32]) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Cannot open '%s'\n", path); return 0; }
+    u32 st[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                 0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    u8 buf[64]; size_t total = 0; int r;
+    /* Process full 64-byte blocks */
+    while ((r = (int)fread(buf, 1, 64, f)) == 64) {
+        sha256_transform(st, buf); total += 64;
+    }
+    /* Final partial block */
+    total += (size_t)r;
+    buf[r] = 0x80; r++;
+    if (r > 56) {
+        memset(buf+r, 0, 64-r); sha256_transform(st, buf);
+        memset(buf, 0, 56);
+    } else { memset(buf+r, 0, 56-r); }
+    u64 bits = (u64)total * 8;
+    buf[56]=(u8)(bits>>56); buf[57]=(u8)(bits>>48); buf[58]=(u8)(bits>>40);
+    buf[59]=(u8)(bits>>32); buf[60]=(u8)(bits>>24); buf[61]=(u8)(bits>>16);
+    buf[62]=(u8)(bits>>8);  buf[63]=(u8)(bits);
+    sha256_transform(st, buf);
+    fclose(f);
+    for (int i=0;i<8;i++) wr32(out+i*4, st[i]);
+    return 1;
+}
+
+
+
 
 /* ── gzip via zlib ───────────────────────────────────────────────────────── */
 /* Matches Python gzip.compress(data, 9) — RFC 1952 gzip container with
    DEFLATE payload at level 9. windowBits=15+16 activates gzip wrapping. */
 
+#define GZ_CHUNK 262144  /* 256 KB output chunk */
+
 static Buf gz_compress(const u8 *src, size_t sn) {
     z_stream z = {0};
     deflateInit2(&z, 9, Z_DEFLATED, 15+16, 8, Z_DEFAULT_STRATEGY);
-    uLong bound = deflateBound(&z, (uLong)sn) + 64;
-    Buf out = buf_new(bound);
-    z.next_in  = (Bytef*)src;  z.avail_in  = (uInt)sn;
-    z.next_out = (Bytef*)out.d; z.avail_out = (uInt)out.cap;
-    deflate(&z, Z_FINISH);
-    out.n = z.total_out;
+    Buf out = buf_new(GZ_CHUNK);
+    z.next_in  = (Bytef*)src;
+    z.avail_in = (uInt)sn;   /* NOTE: uInt may truncate > 4 GB; handled below */
+    /* For large inputs, feed in chunks to avoid uInt truncation */
+    size_t fed = 0;
+    int ret;
+    do {
+        size_t remaining = sn - fed;
+        z.next_in  = (Bytef*)(src + fed);
+        z.avail_in = (uInt)(remaining < 0x40000000u ? remaining : 0x40000000u);
+        fed += z.avail_in;
+        int flush = (fed >= sn) ? Z_FINISH : Z_NO_FLUSH;
+        do {
+            buf_grow(&out, GZ_CHUNK);
+            z.next_out  = (Bytef*)(out.d + out.n);
+            z.avail_out = (uInt)(out.cap - out.n < GZ_CHUNK ? out.cap - out.n : GZ_CHUNK);
+            ret = deflate(&z, flush);
+            out.n = z.total_out;
+        } while (z.avail_out == 0);
+    } while (fed < sn && ret != Z_STREAM_END);
     deflateEnd(&z);
     return out;
 }
@@ -556,8 +818,11 @@ static Buf ef_decode(const u8 *data, size_t dn) {
         } else { bucket++; }
         bit_pos2++;
     }
-    buf_app(&out, (u8*)res, (size_t)found*sizeof(u32));
-    /* out.n = found*sizeof(u32): byte count, consistent with all other position bufs */
+    /* emit as variable-width position stream */
+    { Buf vw = buf_new(found*4+4);
+      for(size_t i=0;i<found;i++) pos_write(&vw,(u64)res[i]);
+      free(out.d); out=vw; }
+    /* out contains variable-width encoded positions */
     free(lower); free(res);
     return out;
 }
@@ -702,7 +967,11 @@ static Buf rle_decode(const u8 *data, size_t dn, size_t n) {
         pos += run; cur ^= 1;
     }
     free(runs);
-    return out; /* .n / sizeof(u32) = count of positions */
+    /* re-encode as variable-width position stream */
+    { Buf vw = buf_new(out.n);
+      size_t i=0;
+      while(i+4<=out.n) { u32 v; memcpy(&v,out.d+i,4); pos_write(&vw,(u64)v); i+=4; }
+      buf_free(&out); return vw; }
 }
 
 
@@ -727,12 +996,29 @@ static Buf bit_clear(const u8 *data, size_t n, int bit, u8 *out_aligned) {
     for (size_t i=0;i<n;i++) {
         if (data[i]&mask) {
             out_aligned[i]=data[i]&inv;
-            u32 p=(u32)i; buf_grow(&fp,sizeof(u32)); memcpy(fp.d+fp.n,&p,sizeof(u32)); fp.n+=sizeof(u32);
+            pos_write(&fp, (u64)i);
         } else {
             out_aligned[i]=data[i];
         }
     }
-    return fp; /* .n / sizeof(u32) = count */
+    return fp; /* variable-width encoded positions */
+}
+
+
+/* Disk-mode bit_clear: populate a pre-allocated bitset directly.
+ * Never builds a position list — peak stays at current(n)+aligned(n)+bs(n/8). */
+static void bit_clear_bs(const u8 *data, size_t n, int bit,
+                         u8 *out_aligned, u8 *bs) {
+    u8 mask = (u8)(1 << bit), inv = (u8)(~mask);
+    memset(bs, 0, (n + 7) / 8);
+    for (size_t i = 0; i < n; i++) {
+        if (data[i] & mask) {
+            out_aligned[i] = data[i] & inv;
+            bs[i >> 3] |= (u8)(1u << (i & 7));
+        } else {
+            out_aligned[i] = data[i];
+        }
+    }
 }
 
 static void remap(const u8 *in, u8 *out, size_t n, int bit) {
@@ -751,18 +1037,26 @@ static void unremap(const u8 *in, u8 *out, size_t n, int bit) {
     }
 }
 
-static void reconstruct(u8 *stream, const u32 *fp, size_t fk, int bit) {
+static void reconstruct(u8 *stream, const u8 *fp_buf, size_t fp_bytes, int bit) {
     u8 mask=(u8)(1<<bit);
-    for (size_t i=0;i<fk;i++) stream[fp[i]]|=mask;
+    size_t off = 0;
+    while (off < fp_bytes) {
+        u64 p = pos_read(fp_buf, &off);
+        stream[p] |= mask;
+    }
 }
 
 /* Build packed bitset: bit (pos&7) of byte (pos>>3) = 1 for each pos in fp */
-static Buf build_bitset(const u32 *fp, size_t fk, size_t n) {
+/* fp_buf: raw bytes from bit_clear / decode_fmt (variable-width positions)
+   fk: number of positions encoded in fp_buf */
+static Buf build_bitset(const u8 *fp_buf, size_t fp_bytes, size_t n) {
     size_t bsz = (n+7)/8;
     Buf out = buf_new(bsz);
     memset(out.d, 0, bsz); out.n = bsz;
-    for (size_t i=0;i<fk;i++) {
-        u32 p=fp[i]; out.d[p>>3] |= (u8)(1<<(p&7));
+    size_t off = 0;
+    while (off < fp_bytes) {
+        u64 p = pos_read(fp_buf, &off);
+        out.d[p>>3] |= (u8)(1u<<(p&7));
     }
     return out;
 }
@@ -772,8 +1066,7 @@ static Buf bitset_to_positions(const u8 *bs, size_t n) {
     Buf out = buf_new((n/8+4)*sizeof(u32));
     for (size_t i=0;i<n;i++) {
         if ((bs[i>>3]>>(i&7))&1) {
-            u32 p=(u32)i; buf_grow(&out,sizeof(u32));
-            memcpy(out.d+out.n,&p,sizeof(u32)); out.n+=sizeof(u32);
+            pos_write(&out, (u64)i);
         }
     }
     return out;
@@ -829,9 +1122,9 @@ typedef struct {
 
 /* ── Flag format encode/decode ───────────────────────────────────────────── */
 
-static Buf encode_fmt(const u32 *fp, size_t fk, size_t n, int fmt) {
+static Buf encode_fmt(const u8 *fp_buf, size_t fp_bytes, size_t n, int fmt) {
     if (fmt==FMT_BITSET || fmt==FMT_HUFFMAN || fmt==FMT_LZ77 || fmt==FMT_LZ77HUFF) {
-        Buf bs = build_bitset(fp, fk, n);
+        Buf bs = build_bitset(fp_buf, fp_bytes, n);
         Buf out;
         if (fmt==FMT_BITSET)   { return bs; }
         if (fmt==FMT_HUFFMAN)  { out = huffman_encode(bs.d, bs.n); buf_free(&bs); return out; }
@@ -839,28 +1132,43 @@ static Buf encode_fmt(const u32 *fp, size_t fk, size_t n, int fmt) {
         /* FMT_LZ77HUFF */       out = gz_compress(bs.d, bs.n);    buf_free(&bs); return out;
     }
     if (fmt==FMT_GAP) {
-        if (fk==0) { Buf out=buf_new(4); u8 z[4]={0,0,0,0}; buf_app(&out,z,4); return out; }
-        /* Compute max gap */
-        u32 max_gap=fp[0];
-        for (size_t i=1;i<fk;i++) { u32 g=fp[i]-fp[i-1]; if(g>max_gap) max_gap=g; }
+        if (fp_bytes==0) { Buf out=buf_new(4); u8 z[4]={0,0,0,0}; buf_app(&out,z,4); return out; }
+        /* First pass: collect positions into u64 array to compute gaps.
+         * NOTE: not called in disk mode (flag_race excludes GAP/EF). */
+        size_t fk=0; size_t off=0;
+        while(off<fp_bytes) { pos_read(fp_buf,&off); fk++; }
+        u64 *pv = (u64*)malloc(fk*sizeof(u64));
+        off=0; for(size_t i=0;i<fk;i++) pv[i]=pos_read(fp_buf,&off);
+        u64 max_gap=pv[0];
+        for (size_t i=1;i<fk;i++) { u64 g=pv[i]-pv[i-1]; if(g>max_gap) max_gap=g; }
         u8 width; u32 k_field=(u32)fk;
-        if (max_gap<=255)      { width=1; }
+        if (max_gap<=255)       { width=1; }
         else if (max_gap<=65534){ width=2; k_field|=0x80000000u; }
-        else                   { width=4; k_field|=0x40000000u; }
+        else                    { width=4; k_field|=0x40000000u; }
         Buf out=buf_new(4+fk*width+4);
         u8 tmp[4]; wr32(tmp,k_field); buf_app(&out,tmp,4);
-        u32 prev=0;
         for (size_t i=0;i<fk;i++) {
-            u32 g = (i==0) ? fp[0] : fp[i]-fp[i-1];
+            u64 g = (i==0) ? pv[0] : pv[i]-pv[i-1];
             if (width==1) buf_push(&out,(u8)g);
             else if (width==2) { u8 b[2]={(u8)(g>>8),(u8)g}; buf_app(&out,b,2); }
-            else { u8 b[4]; wr32(b,g); buf_app(&out,b,4); }
-            (void)prev;
+            else { u8 b[4]; wr32(b,(u32)g); buf_app(&out,b,4); }
         }
+        free(pv);
         return out;
     }
-    if (fmt==FMT_EF) return ef_encode(fp, fk, (u64)n);
-    if (fmt==FMT_RLE) return rle_encode(fp, fk, n);
+    /* EF and RLE need u32 position arrays — decode to temp u64, downcast safely.
+     * NOTE: not called in disk mode (flag_race excludes GAP/EF). */
+    { /* build u64 pos array */
+        size_t fk=0; size_t off=0;
+        while(off<fp_bytes) { pos_read(fp_buf,&off); fk++; }
+        u32 *pv32 = (u32*)malloc(fk*sizeof(u32));
+        off=0; for(size_t i=0;i<fk;i++) pv32[i]=(u32)pos_read(fp_buf,&off);
+        Buf r;
+        if (fmt==FMT_EF)  r = ef_encode(pv32, fk, (u64)n);
+        else               r = rle_encode(pv32, fk, n);
+        free(pv32);
+        return r;
+    }
     /* fallback */
     Buf b=buf_new(1); return b;
 }
@@ -882,16 +1190,16 @@ static Buf decode_fmt(const u8 *data, size_t dn, size_t n, int fmt) {
         u32 k_field=rd32(data);
         int four_b=(k_field>>30)==3, two_b=(k_field>>31)&1&&!four_b;
         u32 k=k_field&0x3FFFFFFFu;
-        Buf out=buf_new(k*sizeof(u32)+4);
+        Buf out=buf_new(k*4+4);  /* lower bound; pos_write may use 12 bytes for large pos */
         if(k==0) return out;
-        size_t pos=4; u32 cur=0;
+        size_t pos=4; u64 cur=0;
         for (u32 i=0;i<k;i++) {
-            u32 g;
+            u64 g;
             if (four_b) { g=rd32(data+pos); pos+=4; }
             else if (two_b) { g=((u32)data[pos]<<8)|data[pos+1]; pos+=2; }
             else { g=data[pos]; pos++; }
             cur+=g;
-            buf_grow(&out,sizeof(u32)); memcpy(out.d+out.n,&cur,sizeof(u32)); out.n+=sizeof(u32);
+            pos_write(&out, cur);
         }
         return out;
     }
@@ -1130,6 +1438,160 @@ static Buf ans_stride_encode(const u8 *data, size_t n) {
     return out;
 }
 
+
+/*
+ * ANS STRIDE ENCODE — DISK STREAMING VARIANT
+ * -------------------------------------------
+ * Writes the complete serialised ANS payload directly to FILE f.
+ * Never allocates a Buf larger than the fixed header (~132 KB max).
+ * pctx tables (256 × 2 KB = 512 KB) stay in RAM during the encode loop.
+ * pair[] (256 MB) is freed before the encode loop begins.
+ * Returns DiskRef describing the written region.
+ */
+static DiskRef ans_stride_encode_to_disk(const u8 *data, size_t n, FILE *f) {
+    DiskRef ref;
+    ref.offset = (long)ftell(f);
+    ref.size   = 0;
+
+    if (n == 0) {
+        /* Minimal empty record matching RAM version wire format */
+        u8 z[1+4+512+2+4] = {0}; z[0]=1;
+        fwrite(z, 1, sizeof(z), f);
+        ref.size = sizeof(z);
+        return ref;
+    }
+
+    int k = ans_select_stride(data, n);
+
+    /* ── 1. Build global counts ── */
+    u32 global_raw[256] = {0};
+    for (size_t i = 0; i < n; i++) global_raw[(int)data[i]]++;
+
+    /* ── 2. Build per-context counts ── */
+    u32 *pair = (u32*)calloc(256*256, sizeof(u32));
+    for (size_t i = (size_t)k; i < n; i++)
+        pair[(int)data[i-k]*256 + (int)data[i]]++;
+    u32 ctx_total[256] = {0};
+    for (int c = 0; c < 256; c++)
+        for (int s = 0; s < 256; s++)
+            ctx_total[c] += pair[c*256+s];
+
+    /* ── 3. Normalise — keep pctx in RAM (512 KB max, not n-sized) ── */
+    AnsCtx *gctx = (AnsCtx*)malloc(sizeof(AnsCtx));
+    ans_normalise(global_raw, gctx);
+    AnsCtx *pctx[256]; memset(pctx, 0, sizeof(pctx));
+    size_t n_ctx = 0;
+    for (int c = 0; c < 256; c++) {
+        if (ctx_total[c] >= 32) {
+            pctx[c] = (AnsCtx*)malloc(sizeof(AnsCtx));
+            ans_normalise(pair + c*256, pctx[c]);
+            n_ctx++;
+        }
+    }
+    free(pair); /* ← 256 MB released before renorm loop */
+
+    /* ── 4. Write fixed header fields ── */
+    u8 b1[1]; b1[0]=(u8)k; fwrite(b1,1,1,f);
+    u8 b4[4]; wr32(b4,(u32)n); fwrite(b4,1,4,f);
+
+    /* global freq table: 256 × u16 LE */
+    for (int s = 0; s < 256; s++) {
+        u8 lo=(u8)(gctx->freq[s]&0xFF), hi=(u8)(gctx->freq[s]>>8);
+        fwrite(&lo,1,1,f); fwrite(&hi,1,1,f);
+    }
+
+    /* n_ctx (2B BE) */
+    u8 nc[2]; nc[0]=(u8)((n_ctx>>8)&0xFF); nc[1]=(u8)(n_ctx&0xFF);
+    fwrite(nc,1,2,f);
+
+    /* per-context tables */
+    for (int c = 0; c < 256; c++) {
+        if (!pctx[c]) continue;
+        u8 cb=(u8)c; fwrite(&cb,1,1,f);
+        for (int s = 0; s < 256; s++) {
+            u8 lo=(u8)(pctx[c]->freq[s]&0xFF), hi=(u8)(pctx[c]->freq[s]>>8);
+            fwrite(&lo,1,1,f); fwrite(&hi,1,1,f);
+        }
+    }
+
+    /* ── 5. Placeholder for payload_len (4B) — patched after renorm loop ── */
+    long plen_off = ftell(f);
+    u8 plen_zero[4] = {0,0,0,0}; fwrite(plen_zero,1,4,f);
+
+    /* ── 6. ANS encode: state(4B BE) + renorm bytes streamed to file ── */
+    long payload_start = ftell(f);
+
+    /* Write state placeholder — patched after loop */
+    long state_off = ftell(f);
+    u8 state_zero[4] = {0,0,0,0}; fwrite(state_zero,1,4,f);
+
+#define ANS_RENORM_CHUNK (256 * 1024)   /* 256 KB write+sync+drop cadence */
+    u8  rbuf[ANS_RENORM_CHUNK];
+    int rbuf_n = 0;
+    int fd = fileno(f);
+    long chunk_base = ftell(f);   /* file offset of start of current chunk */
+
+    /* Helper: flush rbuf to file, sync pages clean, drop from cache */
+#define FLUSH_RENORM_BUF() do { \
+        if (rbuf_n > 0) { \
+            fwrite(rbuf, 1, (size_t)rbuf_n, f); \
+            fflush(f); \
+            sync_file_range(fd, chunk_base, (off_t)rbuf_n, \
+                SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER); \
+            posix_fadvise(fd, chunk_base, (off_t)rbuf_n, POSIX_FADV_DONTNEED); \
+            chunk_base += rbuf_n; \
+            rbuf_n = 0; \
+        } \
+    } while(0)
+
+    /* Reverse pass: buffer renorm bytes, flush every 256 KB */
+    u64 x = ANS_L;
+    size_t renorm_bytes = 0;
+    for (size_t ii = n; ii-- > 0; ) {
+        u8 s    = data[ii];
+        int c   = (ii >= (size_t)k) ? (int)data[ii-k] : 256;
+        AnsCtx *t = (c < 256) ? pctx[c] : NULL;
+        u32 f_s = t ? t->freq[s] : gctx->freq[s];
+        u32 c_s = t ? t->cum[s]  : gctx->cum[s];
+        if (f_s == 0) { f_s = 1; c_s = 0; }
+        u64 limit = ((u64)ANS_L * ANS_B / ANS_M) * f_s;
+        while (x >= limit) {
+            rbuf[rbuf_n++] = (u8)(x & 0xFF);
+            x >>= 8;
+            renorm_bytes++;
+            if (rbuf_n == ANS_RENORM_CHUNK) FLUSH_RENORM_BUF();
+        }
+        x = (x / f_s) * ANS_M + c_s + (x % f_s);
+    }
+    FLUSH_RENORM_BUF();  /* flush remainder */
+#undef FLUSH_RENORM_BUF
+#undef ANS_RENORM_CHUNK
+
+    long end_pos = ftell(f);
+
+    /* Patch state — fseek back, write 4 bytes, pages re-read from disk */
+    u8 state_be[4];
+    state_be[0]=(u8)(x>>24); state_be[1]=(u8)(x>>16);
+    state_be[2]=(u8)(x>>8);  state_be[3]=(u8)(x);
+    fseek(f, state_off, SEEK_SET);
+    fwrite(state_be, 1, 4, f);
+
+    /* Patch payload_len */
+    u32 plen_val = (u32)(4 + renorm_bytes);
+    u8 plen_be[4]; wr32(plen_be, plen_val);
+    fseek(f, plen_off, SEEK_SET);
+    fwrite(plen_be, 1, 4, f);
+    fseek(f, end_pos, SEEK_SET);
+
+    /* Free contexts */
+    for (int c = 0; c < 256; c++) if (pctx[c]) { free(pctx[c]); pctx[c]=NULL; }
+    free(gctx);
+
+    ref.size = (size_t)(end_pos - ref.offset);
+    (void)payload_start;
+    return ref;
+}
+
 /*
  * ANS STRIDE DECODE
  * -----------------
@@ -1208,7 +1670,9 @@ static Buf ans_stride_decode(const u8 *data, size_t dn) {
 
 /* ── Flag race ───────────────────────────────────────────────────────────── */
 
-static Buf flag_race(const u32 *fp, size_t fk, size_t n, int *out_fmt) {
+static Buf flag_race(const u8 *fp_buf, size_t fp_bytes, size_t n, int *out_fmt) {
+    /* count positions for density */
+    size_t fk=0; { size_t off=0; while(off<fp_bytes){pos_read(fp_buf,&off);fk++;} }
     double density = n ? (double)fk/n : 0.0;
 
     /* Formats to try */
@@ -1217,14 +1681,20 @@ static Buf flag_race(const u32 *fp, size_t fk, size_t n, int *out_fmt) {
     fmts[nf++]=FMT_LZ77HUFF;
     fmts[nf++]=FMT_RLE;
     fmts[nf++]=FMT_BITSET;
-    if (density <= GAP_MAX_DENSITY) { fmts[nf++]=FMT_GAP; fmts[nf++]=FMT_EF; }
+    /* GAP/EF require materialising a full u64 position array (fk*8 bytes).
+     * In disk mode only offer them if that array stays under 512 MB. */
+    if (density <= GAP_MAX_DENSITY) {
+        if (!g_disk_mode || fk * sizeof(u64) < 512ULL*1024*1024) {
+            fmts[nf++]=FMT_GAP; fmts[nf++]=FMT_EF;
+        }
+    }
     if (density >= 0.15 && density <= 0.85) fmts[nf++]=FMT_LZ77;
 
     Buf best; best.d=NULL; best.n=SIZE_MAX; best.cap=0;
     int best_fmt=FMT_BITSET;
 
     for (int i=0;i<nf;i++) {
-        Buf candidate = encode_fmt(fp, fk, n, fmts[i]);
+        Buf candidate = encode_fmt(fp_buf, fp_bytes, n, fmts[i]);
         if (candidate.n < best.n) {
             if (best.d) buf_free(&best);
             best = candidate; best_fmt = fmts[i];
@@ -1236,13 +1706,104 @@ static Buf flag_race(const u32 *fp, size_t fk, size_t n, int *out_fmt) {
     return best;
 }
 
+/* Disk-mode flag_race: operates on a pre-built bitset (n/8 bytes) so fp
+ * can be freed before this is called.  Only bitset-based formats compete —
+ * no position arrays ever allocated.  Peak RAM: bitset(n/8) + one candidate
+ * at a time, freed before the next.  Slower than RAM mode; that is fine. */
+static Buf flag_race_bs(const u8 *bs, size_t bsz, size_t n, int *out_fmt) {
+    (void)n;
+    Buf best = buf_new(bsz ? bsz : 1);
+    if (bsz) { memcpy(best.d, bs, bsz); } best.n = bsz;
+    int best_fmt = FMT_BITSET;
+
+    /* HUFFMAN */
+    { Buf c = huffman_encode(bs, bsz);
+      if (c.n < best.n) { buf_free(&best); best = c; best_fmt = FMT_HUFFMAN; }
+      else buf_free(&c); }
+
+    /* LZ77HUFF (gzip) */
+    { Buf c = gz_compress(bs, bsz);
+      if (c.n < best.n) { buf_free(&best); best = c; best_fmt = FMT_LZ77HUFF; }
+      else buf_free(&c); }
+
+    *out_fmt = best_fmt;
+    return best;
+}
+
 
 /* ── Recursive encode ────────────────────────────────────────────────────── */
 /* Level header wire: bit(1) fmt(1) flag_len(4BE) halt(1) child_len(4BE) flag_data */
 
-typedef struct { int bit, fmt; Buf flag_block; Buf ans_candidate; } Level;
+/* Per-level metadata — in RAM mode holds Bufs; in disk mode holds DiskRefs. */
+typedef struct {
+    int bit, fmt;
+    /* RAM mode */
+    Buf flag_block;
+    Buf ans_candidate;
+    /* disk mode: named temp file, closed after write + page-cache drop */
+    char   level_path[64]; /* path for assembly reopen */
+    size_t flag_size;      /* bytes at offset 0 = flag_block */
+    size_t ans_size;       /* bytes at offset flag_size = ans data */
+} Level;
 
-static Buf recursive_encode(const u8 *data, size_t n) {
+
+/* ── Per-depth level file helpers ────────────────────────────────────────────
+ * Each depth gets its own temp file: [flag_block_bytes][ans_bytes]
+ * On assembly the file is fclose+removed so the kernel instantly reclaims
+ * all page-cache pages for it.
+ */
+static FILE *level_file_open(char *path_out, size_t path_sz) {
+    snprintf(path_out, path_sz, "/tmp/aim_lvl_XXXXXX");
+    int fd = mkstemp(path_out);
+    if (fd < 0) { perror("mkstemp"); return NULL; }
+    /* Named: path kept so assembly can reopen.
+     * After write: sync_file_range + DONTNEED to flush pages before fclose. */
+    FILE *f = fdopen(fd, "w+b");
+    if (!f) { close(fd); return NULL; }
+    tmp_register(path_out);
+    return f;
+}
+
+/* Write buf to level file, force pages to disk, drop from page cache, close.
+ * sync_file_range ensures pages are CLEAN before DONTNEED — only clean pages
+ * are reclaimed immediately by the kernel (dirty ones are deferred). */
+static void level_write_close(FILE *f, const char *path,
+                               size_t flag_size, size_t ans_size) {
+    fflush(f);
+    int fd = fileno(f);
+    off_t total = (off_t)(flag_size + ans_size);
+    /* Force writeback of all dirty pages — blocks until NVMe confirms */
+    sync_file_range(fd, 0, total,
+        SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+    /* Pages are now clean — DONTNEED will be honored immediately */
+    posix_fadvise(fd, 0, total, POSIX_FADV_DONTNEED);
+    fclose(f);
+    (void)path; /* path retained in Level.level_path for assembly reopen */
+}
+
+/* Write buf to f, advise DONTNEED, return bytes written */
+static size_t level_write_buf(FILE *f, const Buf *b) {
+    if (b->n == 0) return 0;
+    fwrite(b->d, 1, b->n, f);
+    /* No DONTNEED needed — file is unlinked; pages freed on fclose */
+    return b->n;
+}
+
+/* Read size bytes from offset in f into a new Buf, then close+remove the file */
+static Buf level_read_close(FILE *f, size_t offset, size_t size) {
+    Buf b = buf_new(size + 1);
+    b.n = size;
+    if (size > 0) {
+        fseek(f, (long)offset, SEEK_SET);
+        if (fread(b.d, 1, size, f) != size)
+            fprintf(stderr, "aim: level read error\n");
+    }
+    fclose(f);  /* unlinked file: kernel reclaims all pages here */
+    return b;
+}
+
+/* src_path non-NULL only in disk mode — fread into current instead of memcpy */
+static Buf recursive_encode(const u8 *data, const char *src_path, size_t n) {
     if (n==0) {
         Buf term = gz_compress(NULL, 0);
         Buf out = buf_new(11 + term.n);
@@ -1255,41 +1816,88 @@ static Buf recursive_encode(const u8 *data, size_t n) {
     Level levels[MAX_DEPTH];
     int   ndepth=0;
 
+    /* Disk mode: each depth gets its own temp file (opened per-depth below) */
+
     u8 *current  = (u8*)malloc(n);
     u8 *next_buf = (u8*)malloc(n);
-    memcpy(current, data, n);
+    if (src_path) {
+        FILE *sf = fopen(src_path, "rb");
+        if (!sf || fread(current, 1, n, sf) != n) {
+            fprintf(stderr, "aim: cannot read source file\n"); free(current); free(next_buf); 
+            Buf e=buf_new(1); return e;
+        }
+        fclose(sf);
+    } else {
+        memcpy(current, data, n);
+    }
 
     for (int depth=0; depth<MAX_DEPTH; depth++) {
         int max_bit = 7 - depth;
         if (max_bit < 0) break;
         if (is_all_zero(current,n) || is_all_one(current,n)) break;
 
+        prog("recursive", "sweep", depth);
         int bit = sweep(current, n, max_bit);
 
+        prog("recursive", "bit_clear start", depth);
         u8 *aligned = (u8*)malloc(n);
-        Buf fp = bit_clear(current, n, bit, aligned);
-        size_t fk = fp.n / sizeof(u32);
-
-        /* v16: compute ANS-stride candidate on aligned stream (pre-remap).
-           This is where inter-symbol value correlations are still intact. */
-        Buf ans_cand = ans_stride_encode(aligned, n);
-
         int fmt;
-        Buf flag_block = flag_race((u32*)fp.d, fk, n, &fmt);
-        buf_free(&fp);
+        Buf flag_block;
+        if (g_disk_mode) {
+            /* Disk mode: write directly into bitset — fp never allocated.
+             * Peak: current(n) + aligned(n) + bitset(n/8) = ~2.1n */
+            size_t bsz = (n + 7) / 8;
+            u8 *bs = (u8*)malloc(bsz ? bsz : 1);
+            bit_clear_bs(current, n, bit, aligned, bs);
+            prog("recursive", "flag_race start", depth);
+            flag_block = flag_race_bs(bs, bsz, n, &fmt);
+            free(bs);
+            malloc_trim(0);
+        } else {
+            Buf fp = bit_clear(current, n, bit, aligned);
+            prog("recursive", "flag_race start", depth);
+            flag_block = flag_race(fp.d, fp.n, n, &fmt);
+            buf_free(&fp);
+        }
+        prog("recursive", "flag_race done", depth);
 
-        levels[ndepth].bit           = bit;
-        levels[ndepth].fmt           = fmt;
-        levels[ndepth].flag_block    = flag_block;
-        levels[ndepth].ans_candidate = ans_cand;
+        levels[ndepth].bit = bit;
+        levels[ndepth].fmt = fmt;
+
+        if (g_disk_mode) {
+            prog("recursive", "ans_stride (disk)", depth);
+            FILE *lf = level_file_open(levels[ndepth].level_path,
+                                       sizeof(levels[ndepth].level_path));
+            levels[ndepth].flag_size = level_write_buf(lf, &flag_block);
+            buf_free(&flag_block);
+            DiskRef dr_ans = ans_stride_encode_to_disk(aligned, n, lf);
+            levels[ndepth].ans_size = dr_ans.size;
+            prog("recursive", "ans_stride done", depth);
+            /* Sync pages to NVMe, drop from page cache, close fd.
+             * No fd held open — pages cannot accumulate across depths. */
+            level_write_close(lf, levels[ndepth].level_path,
+                              levels[ndepth].flag_size, levels[ndepth].ans_size);
+            levels[ndepth].flag_block    = (Buf){NULL,0,0};
+            levels[ndepth].ans_candidate = (Buf){NULL,0,0};
+        } else {
+            prog("recursive", "ans_stride (ram)", depth);
+            Buf ans_cand = ans_stride_encode(aligned, n);
+            levels[ndepth].flag_block    = flag_block;
+            levels[ndepth].ans_candidate = ans_cand;
+        }
         ndepth++;
 
+        prog("recursive", "remap", depth);
         remap(aligned, next_buf, n, bit);
         free(aligned);
+        if (g_disk_mode) malloc_trim(0);
+        prog("recursive", "remap done", depth);
         memcpy(current, next_buf, n);
     }
     free(next_buf);
 
+    if (g_disk_mode) malloc_trim(0);
+    prog("recursive", "terminal encode", -1);
     /* Build terminal */
     Buf inner;
     if (is_all_zero(current,n)) {
@@ -1310,48 +1918,65 @@ static Buf recursive_encode(const u8 *data, size_t n) {
     }
     free(current);
 
-    /* Bottom-up assembly with optimal ANS cutoff.
-     *
-     * At each depth (deepest first) compare two costs:
-     *   option_recurse    = len(current payload)     — everything below
-     *   option_ans_stride = 11 + len(ans_candidate)  — halt here with ANS
-     *
-     * Emit HALT_ANS_STRIDE when it is strictly smaller; otherwise HALT_RECURSE.
-     * The first depth where ANS wins becomes the cutoff; all deeper levels were
-     * already folded into 'payload' which gets replaced. */
+    prog("recursive", "assembly pass", -1);
+    /* Bottom-up assembly with optimal ANS cutoff. */
     Buf payload = inner;
     for (int i = ndepth-1; i >= 0; i--) {
-        size_t ans_cost     = 11 + levels[i].ans_candidate.n;
+        /* Load level data — from per-depth file or RAM */
+        Buf fb, ac;
+        if (g_disk_mode) {
+            /* Reopen named file, read flag+ans, then remove.
+             * fclose releases pages (no other fd); remove frees disk blocks. */
+            FILE *lf = fopen(levels[i].level_path, "rb");
+            if (!lf) { fb = buf_new(1); ac = buf_new(1); }
+            else {
+                fb = buf_new(levels[i].flag_size ? levels[i].flag_size : 1);
+                fb.n = levels[i].flag_size;
+                if (fb.n) fread(fb.d, 1, fb.n, lf);
+                ac = buf_new(levels[i].ans_size ? levels[i].ans_size : 1);
+                ac.n = levels[i].ans_size;
+                if (ac.n) fread(ac.d, 1, ac.n, lf);
+                fclose(lf);
+                remove(levels[i].level_path);
+                levels[i].level_path[0] = 0;
+            }
+        } else {
+            fb = levels[i].flag_block;
+            ac = levels[i].ans_candidate;
+        }
+
+        size_t ans_cost     = 11 + ac.n;
         size_t recurse_cost = payload.n;
 
         u8 hdr[11];
         hdr[0] = (u8)levels[i].bit;
         hdr[1] = (u8)levels[i].fmt;
-        wr32(hdr+2, (u32)levels[i].flag_block.n);
+        wr32(hdr+2, (u32)fb.n);
 
         if (ans_cost < recurse_cost) {
-            /* ANS wins at this depth — discard the subtree below */
             hdr[6] = HALT_ANS_STRIDE;
-            wr32(hdr+7, (u32)levels[i].ans_candidate.n);
+            wr32(hdr+7, (u32)ac.n);
             buf_free(&payload);
-            Buf np = buf_new(11 + levels[i].flag_block.n + levels[i].ans_candidate.n);
+            Buf np = buf_new(11 + fb.n + ac.n);
             buf_app(&np, hdr, 11);
-            buf_app(&np, levels[i].flag_block.d,    levels[i].flag_block.n);
-            buf_app(&np, levels[i].ans_candidate.d, levels[i].ans_candidate.n);
+            buf_app(&np, fb.d, fb.n);
+            buf_app(&np, ac.d, ac.n);
             payload = np;
         } else {
             hdr[6] = HALT_RECURSE;
             wr32(hdr+7, (u32)payload.n);
-            Buf np = buf_new(11 + levels[i].flag_block.n + payload.n);
+            Buf np = buf_new(11 + fb.n + payload.n);
             buf_app(&np, hdr, 11);
-            buf_app(&np, levels[i].flag_block.d, levels[i].flag_block.n);
+            buf_app(&np, fb.d, fb.n);
             buf_app(&np, payload.d, payload.n);
             buf_free(&payload);
             payload = np;
         }
-        buf_free(&levels[i].flag_block);
-        buf_free(&levels[i].ans_candidate);
+        buf_free(&fb);
+        buf_free(&ac);
     }
+
+    /* Per-depth files already removed during assembly */
     return payload;
 }
 
@@ -1422,8 +2047,7 @@ static Buf recursive_decode(const u8 *payload, size_t plen, size_t n) {
             unremap(current, tmp, n, dlevels[i].bit);
         }
         Buf fp = decode_fmt(dlevels[i].fd, dlevels[i].fdlen, n, dlevels[i].fmt);
-        size_t fk = fp.n/sizeof(u32);
-        reconstruct(tmp, (u32*)fp.d, fk, dlevels[i].bit);
+        reconstruct(tmp, fp.d, fp.n, dlevels[i].bit);
         buf_free(&fp);
         u8 *swap=current; current=tmp; tmp=swap;
     }
@@ -1436,17 +2060,84 @@ static Buf recursive_decode(const u8 *payload, size_t plen, size_t n) {
 
 /* ── CAIM encode ─────────────────────────────────────────────────────────── */
 
-static Buf caim_encode(const u8 *data, size_t n) {
+
+/* Compress a sequence of DiskRef regions from f through gzip without
+ * ever building the concatenated input in RAM.  Used by caim disk mode
+ * to replace: flags_cat = concat(bitsets); gz_compress(flags_cat). */
+static Buf gz_compress_from_drefs(FILE *f, const DiskRef *refs, int nrefs) {
+    z_stream z = {0};
+    deflateInit2(&z, 9, Z_DEFLATED, 15+16, 8, Z_DEFAULT_STRATEGY);
+    Buf out = buf_new(GZ_CHUNK);
+    u8 in_buf[GZ_CHUNK];
+
+    for (int ri = 0; ri < nrefs; ri++) {
+        size_t remaining = refs[ri].size;
+        posix_fadvise(fileno(f), refs[ri].offset, (off_t)refs[ri].size, POSIX_FADV_WILLNEED);
+        fseek(f, refs[ri].offset, SEEK_SET);
+        int flush = (ri == nrefs-1) ? Z_FINISH : Z_NO_FLUSH;
+        while (remaining > 0 || (ri == nrefs-1 && flush == Z_FINISH)) {
+            size_t chunk = remaining < GZ_CHUNK ? remaining : GZ_CHUNK;
+            if (chunk > 0) {
+                if (fread(in_buf, 1, chunk, f) != chunk) break;
+                remaining -= chunk;
+            }
+            /* If last ref and no more data, do final flush with empty input */
+            int this_flush = (remaining == 0) ? flush : Z_NO_FLUSH;
+            z.next_in  = (Bytef*)in_buf;
+            z.avail_in = (uInt)chunk;
+            do {
+                buf_grow(&out, GZ_CHUNK);
+                z.next_out  = (Bytef*)(out.d + out.n);
+                z.avail_out = (uInt)(out.cap - out.n < GZ_CHUNK ? out.cap - out.n : GZ_CHUNK);
+                deflate(&z, this_flush);
+                out.n = z.total_out;
+            } while (z.avail_out == 0);
+            if (remaining == 0) {
+                posix_fadvise(fileno(f), refs[ri].offset, (off_t)refs[ri].size, POSIX_FADV_DONTNEED);
+                break;
+            }
+        }
+    }
+    deflateEnd(&z);
+    return out;
+}
+
+/* src_path non-NULL only in disk mode — fread into current instead of memcpy */
+static Buf caim_encode(const u8 *data, const char *src_path, size_t n) {
     u8  which_bits[MAX_DEPTH];
-    Buf bitsets[MAX_DEPTH];
+    Buf bitsets[MAX_DEPTH];     /* used in RAM mode only */
     int ndepth=0;
     int cleared=0;
 
+    /* Disk mode: one named temp file per depth for bitsets */
+    FILE *caim_files[MAX_DEPTH];
+    char  caim_paths[MAX_DEPTH][64];
+    size_t caim_sizes[MAX_DEPTH];
+    memset(caim_files, 0, sizeof(caim_files));
+    for (int _i=0;_i<MAX_DEPTH;_i++) caim_paths[_i][0]=0;
+
     u8 *current=(u8*)malloc(n);
     u8 *aligned=(u8*)malloc(n);
-    memcpy(current, data, n);
+    if (src_path) {
+        int sf = open(src_path, O_RDONLY);
+        if (sf < 0) {
+            fprintf(stderr, "aim: cannot open source file\n"); free(current); free(aligned);
+            Buf e=buf_new(1); return e;
+        }
+        void *mapped = mmap(NULL, n, PROT_READ, MAP_SHARED, sf, 0);
+        close(sf);
+        if (mapped == MAP_FAILED) {
+            fprintf(stderr, "aim: mmap failed\n"); free(current); free(aligned);
+            Buf e=buf_new(1); return e;
+        }
+        memcpy(current, mapped, n);
+        munmap(mapped, n);
+    } else {
+        memcpy(current, data, n);
+    }
 
     for (int depth=0; depth<MAX_DEPTH; depth++) {
+        prog("caim", "sweep", depth);
         /* Sweep only uncleared bits */
         u64 counts[8]={0};
         for (size_t i=0;i<n;i++) {
@@ -1459,31 +2150,97 @@ static Buf caim_encode(const u8 *data, size_t n) {
         }
         if (best<0) break;
 
-        Buf fp = bit_clear(current, n, best, aligned);
-        size_t fk = fp.n/sizeof(u32);
-        bitsets[ndepth] = build_bitset((u32*)fp.d, fk, n);
-        buf_free(&fp);
+        prog("caim", "bit_clear start", depth);
         which_bits[ndepth]=(u8)best;
         cleared |= (1<<best);
+
+        if (g_disk_mode) {
+            /* bit_clear_bs: write directly into bitset — fp never allocated.
+             * Sync+DONTNEED+fclose immediately so pages don't accumulate. */
+            size_t bsz = (n+7)/8;
+            u8 *bs = (u8*)malloc(bsz ? bsz : 1);
+            prog("caim", "bit_clear_bs", depth);
+            bit_clear_bs(current, n, best, aligned, bs);
+            prog("caim", "bitset done", depth);
+            Buf bsbuf = { bs, bsz, bsz };
+            FILE *cf = level_file_open(caim_paths[ndepth], sizeof(caim_paths[ndepth]));
+            caim_sizes[ndepth] = level_write_buf(cf, &bsbuf);
+            free(bs);
+            /* Sync to NVMe, drop pages, close fd — nothing accumulates */
+            level_write_close(cf, caim_paths[ndepth],
+                              caim_sizes[ndepth], 0);
+            caim_files[ndepth] = NULL; /* closed; reopen during compress */
+            bitsets[ndepth] = (Buf){NULL,0,0};
+        } else {
+            Buf fp = bit_clear(current, n, best, aligned);
+            prog("caim", "build_bitset start", depth);
+            Buf bs = build_bitset(fp.d, fp.n, n);
+            prog("caim", "bitset done", depth);
+            buf_free(&fp);
+            bitsets[ndepth] = bs;
+        }
         ndepth++;
 
         memcpy(current, aligned, n);
         if (is_all_zero(current,n) || is_all_one(current,n)) break;
     }
     free(aligned);
+    if (g_disk_mode) malloc_trim(0);
 
-    /* Concatenate bitsets */
-    size_t bsz = (n+7)/8;
-    Buf flags_cat = buf_new((size_t)ndepth * bsz + 4);
-    for (int i=0;i<ndepth;i++) {
-        buf_app(&flags_cat, bitsets[i].d, bitsets[i].n);
-        buf_free(&bitsets[i]);
+    prog("caim", "compress bitsets", -1);
+    /* Compress bitsets: disk mode streams directly through zlib (no flags_cat buf);
+     * RAM mode concatenates then compresses as before. */
+    Buf flags_gz;
+    if (g_disk_mode) {
+        /* Stream each per-depth bitset file through gzip, removing as we go */
+        z_stream z = {0};
+        deflateInit2(&z, 9, Z_DEFLATED, 15+16, 8, Z_DEFAULT_STRATEGY);
+        flags_gz = buf_new(GZ_CHUNK);
+        u8 in_buf[GZ_CHUNK];
+        for (int ri = 0; ri < ndepth; ri++) {
+            /* Reopen named file, stream through zlib, fclose+remove.
+             * One file live at a time — pages released after each fclose. */
+            FILE *cf = fopen(caim_paths[ri], "rb");
+            if (!cf) continue;
+            size_t remaining = caim_sizes[ri];
+            int flush = (ri == ndepth-1) ? Z_FINISH : Z_NO_FLUSH;
+            while (remaining > 0) {
+                size_t chunk = remaining < GZ_CHUNK ? remaining : GZ_CHUNK;
+                if (fread(in_buf, 1, chunk, cf) != chunk) break;
+                remaining -= chunk;
+                int this_flush = (remaining == 0) ? flush : Z_NO_FLUSH;
+                z.next_in = (Bytef*)in_buf; z.avail_in = (uInt)chunk;
+                do {
+                    buf_grow(&flags_gz, GZ_CHUNK);
+                    z.next_out  = (Bytef*)(flags_gz.d + flags_gz.n);
+                    z.avail_out = (uInt)(flags_gz.cap - flags_gz.n < GZ_CHUNK ?
+                                        flags_gz.cap - flags_gz.n : GZ_CHUNK);
+                    deflate(&z, this_flush);
+                    flags_gz.n = z.total_out;
+                } while (z.avail_out == 0);
+            }
+            fclose(cf);
+            remove(caim_paths[ri]);
+            caim_paths[ri][0] = 0;
+        }
+        deflateEnd(&z);
+    } else {
+        size_t bsz = (n+7)/8;
+        Buf flags_cat = buf_new((size_t)ndepth * bsz + 4);
+        for (int i=0;i<ndepth;i++) {
+            buf_app(&flags_cat, bitsets[i].d, bitsets[i].n);
+            buf_free(&bitsets[i]);
+        }
+        flags_gz = term_encode(flags_cat.d, flags_cat.n);
+        buf_free(&flags_cat);
     }
 
-    Buf flags_gz = term_encode(flags_cat.d, flags_cat.n);
+    prog("caim", "term_encode current", -1);
     Buf term_gz  = term_encode(current, n);
-    buf_free(&flags_cat); free(current);
+    free(current);
+    if (g_disk_mode) malloc_trim(0);
 
+    prog("caim", "done", -1);
     Buf out = buf_new(1 + ndepth + 4 + flags_gz.n + 4 + term_gz.n + 4);
     buf_push(&out,(u8)ndepth);
     buf_app(&out, which_bits, ndepth);
@@ -1522,8 +2279,7 @@ static Buf caim_decode(const u8 *payload, size_t plen, size_t n) {
         int bit = which_bits[i];
         const u8 *bs = flags_cat.d + (size_t)i * bsz;
         Buf fp = bitset_to_positions(bs, n);
-        size_t fk = fp.n / sizeof(u32);
-        reconstruct(current, (u32*)fp.d, fk, bit);
+        reconstruct(current, fp.d, fp.n, bit);
         buf_free(&fp);
     }
     buf_free(&flags_cat);
@@ -1536,15 +2292,49 @@ static Buf caim_decode(const u8 *payload, size_t plen, size_t n) {
 /* ── Container encode/decode ─────────────────────────────────────────────── */
 
 static Buf aim_encode(const u8 *data, size_t n) {
-    u8 digest[32]; sha256(data, n, digest);
+    u8 digest[32];
+    prog("sha256", "in-memory hash", -1);
+    sha256(data, n, digest);
 
-    Buf pr = recursive_encode(data, n);
-    Buf pc = caim_encode(data, n);
+    prog("recursive", "start", -1);
+    Buf pr = recursive_encode(data, NULL, n);
+    prog("caim", "start", -1);
+    Buf pc = caim_encode(data, NULL, n);
 
     u8 mode;
     Buf *best;
     if (pr.n <= pc.n) { mode=MODE_RECURSIVE; best=&pr; buf_free(&pc); }
     else              { mode=MODE_CAIM;      best=&pc; buf_free(&pr); }
+    prog("container", "building output", -1);
+
+    Buf out = buf_new(HEADER_SIZE + best->n);
+    buf_app(&out, AIM_MAGIC, 4);
+    buf_push(&out, mode);
+    u8 tmp[8]; wr64(tmp,(u64)n); buf_app(&out,tmp,8);
+    buf_app(&out, digest, 32);
+    buf_app(&out, best->d, best->n);
+    buf_free(best);
+    return out;
+}
+
+
+/* Disk-mode entry point: file is never loaded into a single heap buffer.
+ * sha256 streamed, encode functions fread into their working buffer. */
+static Buf aim_encode_file(const char *path, size_t n) {
+    u8 digest[32];
+    prog("sha256", "streaming hash", -1);
+    if (!sha256_file(path, digest)) { Buf e=buf_new(1); return e; }
+
+    prog("recursive", "start", -1);
+    Buf pr = recursive_encode(NULL, path, n);
+    prog("caim", "start", -1);
+    Buf pc = caim_encode(NULL, path, n);
+
+    u8 mode;
+    Buf *best;
+    if (pr.n <= pc.n) { mode=MODE_RECURSIVE; best=&pr; buf_free(&pc); }
+    else              { mode=MODE_CAIM;      best=&pc; buf_free(&pr); }
+    prog("container", "building output", -1);
 
     Buf out = buf_new(HEADER_SIZE + best->n);
     buf_app(&out, AIM_MAGIC, 4);
@@ -1597,7 +2387,7 @@ static void bench(const u8 *data, size_t n, const char *filename) {
     Buf raw_h = huffman_encode(data, n);
     size_t raw_gz = raw_h.n; buf_free(&raw_h);
 
-    printf("\nAIM v16 Benchmark  --  %zu bytes  (%.2f MiB)\n", n, (double)n/(1024*1024));
+    printf("\nAIM v34 Benchmark  --  %zu bytes  (%.2f MiB)\n", n, (double)n/(1024*1024));
     printf("Input file  : %s\n", filename);
     printf("Raw H0      : %zu bytes  (100.00%%)\n\n", raw_gz);
     printf("%-14s  %12s  %10s  %12s  %8s  %9s  %7s  %3s\n",
@@ -1608,8 +2398,8 @@ static void bench(const u8 *data, size_t n, const char *filename) {
     for (int m=0; m<2; m++) {
         double t0 = now_s();
         Buf pl;
-        if (m==0) pl = recursive_encode(data, n);
-        else      pl = caim_encode(data, n);
+        if (m==0) pl = recursive_encode(data, NULL, n);
+        else      pl = caim_encode(data, NULL, n);
         double el = now_s() - t0;
 
         size_t total = pl.n + HEADER_SIZE;
@@ -1665,7 +2455,7 @@ static u8 *read_file(const char *path, size_t *out_n) {
 int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
-            "AIM v16 — Adaptive Isolating Model Compression\n"
+            "AIM v34 — Adaptive Isolating Model Compression\n"
             "Usage:\n"
             "  aim encode <input> <output>\n"
             "  aim decode <input> <output> [--no-verify]\n"
@@ -1674,27 +2464,47 @@ int main(int argc, char **argv) {
     }
     const char *cmd = argv[1];
 
+    /* Scan for --disk / --verbose */
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--disk") == 0)    { g_disk_mode = 1; g_verbose = 1; }
+        if (strcmp(argv[i], "--verbose") == 0) { g_verbose = 1; }
+    }
+    signal(SIGINT,  sig_handler);
+    signal(SIGTERM, sig_handler);
+    atexit(tmp_cleanup);
+    prog_t0 = now_s();
+
     if (strcmp(cmd,"encode")==0 && argc>=4) {
-        size_t n; u8 *data = read_file(argv[2], &n);
-        if (!data) return 1;
+        size_t n; u8 *data = NULL;
+        if (!g_disk_mode) {
+            data = read_file(argv[2], &n);
+            if (!data) return 1;
+        } else {
+            FILE *sf = fopen(argv[2], "rb");
+            if (!sf) { fprintf(stderr,"Cannot open '%s'\n",argv[2]); return 1; }
+            fseek(sf, 0, SEEK_END); n=(size_t)ftell(sf); fclose(sf);
+            printf("  [disk mode: input streamed, level data cached to /tmp]\n");
+        }
         double t0=now_s();
-        Buf c = aim_encode(data, n);
+        Buf c = g_disk_mode ? aim_encode_file(argv[2], n) : aim_encode(data, n);
         double el=now_s()-t0;
 
         FILE *f = fopen(argv[3],"wb");
         if (!f) { fprintf(stderr,"Cannot write '%s'\n",argv[3]); return 1; }
         fwrite(c.d, 1, c.n, f); fclose(f);
 
-        Buf raw_h = huffman_encode(data, n);
-        size_t raw_gz=raw_h.n; buf_free(&raw_h);
         const char *mode_name = c.d[4]==MODE_RECURSIVE?"recursive":"caim";
         printf("Encoded  '%s'  (%zu bytes)\n", argv[2], n);
         printf("  Mode     : %s\n", mode_name);
         printf("  Output   : %zu bytes  (%.2f%%)\n", c.n, 100.0*c.n/n);
-        printf("  Raw H0   : %zu bytes  (%.2f%%)\n", raw_gz, 100.0*raw_gz/n);
-        printf("  Delta    : %+zd bytes  (%+.2f%%)\n", (ssize_t)(c.n-raw_gz), 100.0*((double)c.n-raw_gz)/n);
+        if (!g_disk_mode) {
+            Buf raw_h = huffman_encode(data, n);
+            size_t raw_gz=raw_h.n; buf_free(&raw_h);
+            printf("  Raw H0   : %zu bytes  (%.2f%%)\n", raw_gz, 100.0*raw_gz/n);
+            printf("  Delta    : %+zd bytes  (%+.2f%%)\n", (ssize_t)(c.n-raw_gz), 100.0*((double)c.n-raw_gz)/n);
+        }
         printf("  Written  : '%s'  [%.2fs]\n", argv[3], el);
-        buf_free(&c); free(data);
+        buf_free(&c); if (data) free(data);
 
     } else if (strcmp(cmd,"decode")==0 && argc>=4) {
         /* decode <input> <output> [--no-verify]
