@@ -11,6 +11,7 @@ Encoded  'sample-full.wav'  (40,581,228 bytes)
   Delta  : -10,509,873 bytes  (-25.90% vs gzip)
   Time   : 8.68s
 ```
+```
 $ ./aim encode DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf DeepSeek-R1.aim4
 Encoded  'DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf'  (5027782720 bytes)
   Mode     : c-aim
@@ -20,7 +21,7 @@ Encoded  'DeepSeek-R1-0528-Qwen3-8B-Q4_K_M.gguf'  (5027782720 bytes)
   Written  : 'DeepSeekr1.aim'  [920.12s]
 
 4.7 GB DeepSeek R1 GGUF → 586 MB, −87.77%, lossless, SHA-256 verified"
-
+```
 ---
 
 ## What it is
