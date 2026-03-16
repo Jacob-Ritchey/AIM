@@ -135,7 +135,7 @@ At each depth, 7 codecs compete for the flag set. The shortest wins:
 
 | File | Description |
 | --- | --- |
-| `aim_v33.c` | C reference. Single file. `gcc -O3 -o aim aim_v33.c -lz -lm`. Zero warnings at `-Wall -Wextra`. Disk mode with bounded memory. |
+| `aim_v45.c` | C reference. Single file. `gcc -O3 -o aim aim_v33.c -lz -lm`. Zero warnings at `-Wall -Wextra`. Disk mode with bounded memory. |
 | `aim_v15.py` | Python reference (older version, known memory bugs, not recommended for encoding). Standard library + NumPy + zlib. Wire-compatible with v16. |
 Both are wire-compatible. Files encoded by either implementation decode correctly with the other. All outputs are SHA-256 verified.
 
