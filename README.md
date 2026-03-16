@@ -57,10 +57,10 @@ Single file. Only dependency: zlib.
 ./aim encode input.bin output.aim --disk
 
 # Decode (SHA-256 verified)
-./aim decode output.aim recovered.bin
+./aim3 decode output.aim recovered.bin
 
 # Benchmark both modes
-./aim bench input.bin
+./aim3 bench input.bin
 ```
 
 ---
