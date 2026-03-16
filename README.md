@@ -3,7 +3,7 @@
 **A parameter-free framework for recursive bit-plane decomposition of arbitrary byte data.**
 
 ```
-$ ./aim encode sample-full.wav sample.aim4
+$ ./aim3 encode sample-full.wav sample.aim3
 
 Encoded  'sample-full.wav'  (40,581,228 bytes)
   Mode   : recursive
@@ -26,7 +26,7 @@ AIM exploits both. At each recursive depth it:
 1. Sweeps all 8 bit positions to find the sparsest bit plane
 2. Separates that plane as a flag set
 3. **Before remapping**, computes an rANS order-1 stride-k encoding of the aligned stream — the last point where inter-symbol value correlations are intact
-4. Compresses the flag set using the best of 7 available codecs
+4. Compresses the flag set using the best of 4 available codecs
 5. Remaps the aligned stream to a reduced symbol alphabet and recurses
 
 During bottom-up assembly, the encoder finds the **optimal cutoff**: the earliest depth where the rANS encoding is smaller than the entire remaining subtree. If that depth exists, it halts there and discards the deeper levels. If it never exists, the output is identical to v14.
@@ -39,11 +39,30 @@ The algorithm is **parameter-free**: every decision — which bit, which codec, 
 
 ## Build
 
+The C implementation lives in `aim3_c/`. Build with make:
+
 ```bash
-gcc -O3 -o aim aim.c -lz -lm
+cd aim3_c
+make
 ```
 
-Single file. Only dependency: zlib.
+Dependencies: zlib, libm. Zero warnings at `-Wall -Wextra`.
+
+To build for Windows (requires mingw-w64):
+
+```bash
+cd aim3_c
+make windows
+```
+
+**Pre-built binaries** for Linux (`aim3`) and Windows (`aim3.exe`) are included in the repo root if you don't want to build from source.
+
+A quick round-trip smoke test is included:
+
+```bash
+cd aim3_c
+make test
+```
 
 ---
 
@@ -51,17 +70,122 @@ Single file. Only dependency: zlib.
 
 ```bash
 # Encode
-./aim encode input.bin output.aim
+./aim3 encode input.bin output.aim3
 
-# Encode large file with bounded memory
-./aim encode input.bin output.aim --disk
+# Encode with options
+./aim3 encode input.bin output.aim3 --backend ans-stride --verbose --log run.log
 
-# Decode (SHA-256 verified)
-./aim3 decode output.aim recovered.bin
+# Decode (SHA-256 verified by default)
+./aim3 decode output.aim3 recovered.bin
 
-# Benchmark both modes
+# Decode without verification
+./aim3 decode output.aim3 recovered.bin --no-verify
+
+# Benchmark AIM3 vs gzip/bzip2/xz/zstd/lz4/brotli
 ./aim3 bench input.bin
+./aim3 bench input.bin --fast
+
+# Benchmark flag codec competition
+./aim3 flagbench input.bin
 ```
+
+### Encode options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--target-bit N` | auto | Force bit-plane selection to bit N (0–7) |
+| `--backend NAME` | auto | Force aligned-data backend: `gzip`, `ans0`, `ans1`, `ans2d`, `ans-stride` |
+| `--gz-level N` | 9 | gzip compression level (1–9) |
+| `--verbose` | off | Print per-backend sizes during encoding |
+| `--sample-cap N` | 0 (full) | Use only the first N bytes for bit selection |
+| `--log <path>` | — | Write a structured run log (INI format) to file |
+
+### Decode options
+
+| Option | Default | Description |
+| --- | --- | --- |
+| `--no-verify` | off | Skip SHA-256 integrity check |
+| `--log <path>` | — | Write a structured decode log to file |
+
+---
+
+## Benchmark script
+
+`benchmark.sh` runs AIM3 against a suite of industry-standard compressors (gzip, bzip2, xz, zstd, lz4, brotli) across all files in a directory and writes a timestamped log:
+
+```bash
+./benchmark.sh /path/to/test/files [output.log]
+```
+
+Set `AIMC=/path/to/aim3` to point it at a non-default binary location.
+
+---
+
+## AIM_Web_Analyzer
+
+`AIM_Web_Analyzer.html` is a self-contained browser tool for analysing the entropy structure of arbitrary binary files. It has nothing to do with AIM3-encoded containers — it operates on raw data and is used during development to understand what structure is present before deciding how to target it.
+
+Open the HTML file in any browser, drag-and-drop a binary file, and it runs entirely client-side. The analysis is organised into tabs:
+
+| Tab | What it shows |
+| --- | --- |
+| Decay | Bit-plane sweep decay profile across recursive depths; fingerprint classification (gradient, periodic, noise, uniform, etc.) |
+| Bit distribution | Per-bit-plane density and asymmetry across the full file |
+| Bit entropy | Per-bit-plane Shannon entropy; identifies which planes carry structure vs. which are near-uniform |
+| Bit sweep | Which bit plane the sweep algorithm would select at each depth, and why |
+| Stride | Conditional entropy H(X_i \| X_{i−k}) for k ∈ {1,2,3,4,6,8,12,16}; identifies period-k structure in the value domain |
+| Structure probe | Modular structure check for common formats (mod 3/4/6/8/12/16) |
+| Fingerprint | Composite structural fingerprint and predicted halt condition |
+| Compression | Per-backend compression estimates: gzip, ANS-0/1/2d, ANS-stride, CAIM |
+| Entropy models | Multiple entropy models compared against each other |
+| Entropy predictor | Predicted entropy change per depth under the sweep transform |
+| Linear chain | Step-by-step linear transform chain visualisation |
+| Invariant | Structural invariant tracking across depths |
+
+The most useful workflow when evaluating a new binary format: load a representative file, check the **Decay** tab for whether the fingerprint is gradient-class or noise-class, check **Stride** for period-k value correlations, and check **Compression** to see whether ANS-stride or recursive wins on the backend race. This tells you whether AIM is likely to gain anything on the format before you run the encoder.
+
+---
+
+## AIM_Chunk_Analyzer
+
+`AIM_Chunk_Analyzer.py` is a Python tool for chunk-level structural analysis of large binary files. It solves a specific limitation of the global analysis path: treating a large file as a single unit produces a blended profile that masks structural variation between regions. A raw video file, for example, contains frames ranging from near-static title cards (low halt depth, strong bit-plane structure) to high-motion sequences (high halt depth, near-noise). Analysed globally, you see the mixture; analysed per-chunk, you see both.
+
+The tool produces a **complexity series** — a structural timeline mapping byte offset → fingerprint class, halt depth, optimal bit, and entropy outcome — and optionally detects structural transitions between regions.
+
+It also implements **AIMC chunked encoding**: a chunked AIM variant where each chunk is independently encoded with the optimal bit target for that region, and chunks classified as uniform noise fall back to raw gzip rather than paying AIM's flag overhead. For heavily mixed files (partially compressed containers, video with mixed motion) this can recover 10–30% overhead compared to a single global encode.
+
+```bash
+# Built-in synthetic demo (no file required)
+python AIM_Chunk_Analyzer.py
+
+# Analyse with adaptive chunk sizing
+python AIM_Chunk_Analyzer.py myfile.bin
+
+# Fixed chunk size
+python AIM_Chunk_Analyzer.py myfile.bin --chunk-size 4096
+
+# Raw video — frame-aligned chunking
+python AIM_Chunk_Analyzer.py video.raw --width 1920 --height 1080
+python AIM_Chunk_Analyzer.py video.raw --frame-size 6220800
+
+# Global vs chunked compression comparison
+python AIM_Chunk_Analyzer.py myfile.bin --compare
+
+# Detect structural transitions between chunks
+python AIM_Chunk_Analyzer.py myfile.bin --transitions
+
+# Aggregate statistics across all chunks
+python AIM_Chunk_Analyzer.py myfile.bin --summary
+
+# Chunked encode/decode (AIMC format)
+python AIM_Chunk_Analyzer.py myfile.bin --encode out.aimc
+python AIM_Chunk_Analyzer.py out.aimc --decode recovered.bin
+
+# Write per-chunk detail logs to a directory
+python AIM_Chunk_Analyzer.py myfile.bin --log-dir ./chunk_logs
+```
+
+Dependencies: Python 3.9+, stdlib only. `tqdm` is optional for progress display. Parallel analysis is available via `--workers N`.
 
 ---
 
@@ -93,17 +217,28 @@ AIM is not a universal improvement over gzip. It is a structural improvement for
 
 ## Flag codec race
 
-At each depth, 7 codecs compete for the flag set. The shortest wins:
+At each depth, 4 codecs compete for the flag set. The shortest wins:
 
-| Format                                    | Best for                             |
-| ----------------------------------------- | ------------------------------------ |
-| GAP — first position + varbyte gaps       | Sparse sets (< 5% density)           |
-| BITSET — dense bit vector                 | General; always applicable           |
-| ELIAS-FANO — monotone sequence encoding   | Clustered gap structure              |
-| RLE — run-length on bitset                | Alternating run patterns             |
-| HUFFMAN — canonical Huffman on flag bytes | Mid-density with byte repetition     |
-| LZ77 — sliding window match-copy          | Positional repetition in flag stream |
-| LZ77+HUFFMAN — DEFLATE (gzip)             | Large flag sets, mixed structure     |
+| Format | Best for |
+| --- | --- |
+| GAP+GZ — varbyte gap list, gzip-compressed | Sparse sets (< 5% density) |
+| BITSET — dense bit vector, gzip-compressed | General; always applicable |
+| ELIAS-FANO — monotone sequence encoding | Clustered gap structure |
+| GAMMA-RLE — Elias Gamma coded run lengths | Alternating run patterns |
+
+---
+
+## Aligned-data backends
+
+Five backends compete for the aligned stream. The shortest wins (or a specific one can be forced with `--backend`):
+
+| Name | Description |
+| --- | --- |
+| `gzip` | zlib DEFLATE |
+| `ans0` | rANS order-0 |
+| `ans1` | rANS order-1 |
+| `ans2d` | rANS order-2 with delta coding |
+| `ans-stride` | rANS order-1 stride-k; k auto-selected |
 
 ---
 
@@ -121,13 +256,13 @@ At each depth, 7 codecs compete for the flag set. The shortest wins:
 
 ## Halt conditions
 
-| Code | Name            | Trigger                                         |
-| ---- | --------------- | ----------------------------------------------- |
-| 0    | HALT_RECURSE    | Default — not a terminal                        |
-| 1    | HALT_TERMINAL   | MAX_DEPTH = 8 reached                           |
-| 2    | HALT_ZERO       | Aligned stream is all-zero bytes                |
-| 3    | HALT_ONE        | Aligned stream is all-one bytes                 |
-| 4    | HALT_ANS_STRIDE | rANS stride-k encoding < remaining subtree cost |
+| Code | Name | Trigger |
+| --- | --- | --- |
+| 0 | HALT_RECURSE | Default — not a terminal |
+| 1 | HALT_TERMINAL | MAX_DEPTH = 8 reached |
+| 2 | HALT_ZERO | Aligned stream is all-zero bytes |
+| 3 | HALT_ONE | Aligned stream is all-one bytes |
+| 4 | HALT_ANS_STRIDE | rANS stride-k encoding < remaining subtree cost |
 
 ---
 
@@ -135,11 +270,14 @@ At each depth, 7 codecs compete for the flag set. The shortest wins:
 
 | File | Description |
 | --- | --- |
-| `aim_v45.c` | C reference. Single file. `gcc -O3 -o aim aim_v33.c -lz -lm`. Zero warnings at `-Wall -Wextra`. Disk mode with bounded memory. |
-| `aim_v15.py` | Python reference (older version, known memory bugs, not recommended for encoding). Standard library + NumPy + zlib. Wire-compatible with v16. |
-Both are wire-compatible. Files encoded by either implementation decode correctly with the other. All outputs are SHA-256 verified.
+| `aim3_c/` | C implementation (v6.7.5). Multi-file project; build with `make`. Zero warnings at `-Wall -Wextra`. |
+| `aim.py` | Python reference implementation. Standard library + NumPy + zlib. Wire-compatible with the C implementation. |
+| `aim3` | Pre-built Linux binary |
+| `aim3.exe` | Pre-built Windows binary |
 
-Python is the readable reference. C is ~29× faster on large files (8.7s vs 252s on the 38.7 MB WAV).
+Both implementations are wire-compatible. Files encoded by either decode correctly with the other. All outputs are SHA-256 verified.
+
+Python is the readable reference. C is ~29× faster on large files.
 
 ---
 
@@ -147,19 +285,19 @@ Python is the readable reference. C is ~29× faster on large files (8.7s vs 252s
 
 `AIM_Specification` contains the complete wire format. Sufficient to implement a correct AIM decoder in any language without reference to the source files. Covers the rANS codec to implementable precision, the stride selection algorithm, all five halt conditions, and the ANS-stride payload wire format.
 
-Container header (45 bytes): `AIM4` magic + mode (1B) + original length (8B BE) + SHA-256 (32B).
+Container header (64 bytes): `AIM3` magic + version (1B) + original length (8B BE) + SHA-256 (32B) + reserved padding.
 
 ---
 
 ## Paper
 
-`AIM_Framework_Paper` — *Adaptive Isolating Model (AIM): A Universal Algorithm for Bit-Plane Structure* — covers the theoretical foundations, formal proofs, the remap dissolution problem and why HALT_ANS_STRIDE addresses it, the non-domain justification for stride selection, relationship to existing work (bit-plane coding, DPCM, wavelets, LZ77, ANS), the Huffman analogy, and the full empirical evaluation including the fight_club YUV benchmark.
+`Adaptive Isolating Model.pdf` — covers the theoretical foundations, formal proofs, the remap dissolution problem and why HALT_ANS_STRIDE addresses it, the non-domain justification for stride selection, relationship to existing work (bit-plane coding, DPCM, wavelets, LZ77, ANS), the Huffman analogy, and the full empirical evaluation including the fight_club YUV benchmark.
 
 ---
 
 ## The Huffman analogy
 
-Huffman coding formalised the optimal parameter-free algorithm for symbol-frequency structure. AIM claims the analogous position for bit-plane and inter-symbol stride structure: universal over arbitrary byte data, lossless, parameter-free, deterministically terminating. The two methods are orthogonal — Huffman appears inside AIM as one of the seven flag codecs, and rANS appears as the HALT_ANS_STRIDE backend.
+Huffman coding formalised the optimal parameter-free algorithm for symbol-frequency structure. AIM claims the analogous position for bit-plane and inter-symbol stride structure: universal over arbitrary byte data, lossless, parameter-free, deterministically terminating. The two methods are orthogonal — Huffman appears inside AIM as one of the flag-compression backends, and rANS appears as the HALT_ANS_STRIDE backend.
 
 > *The goal is not to beat gzip. The goal is to know what you are compressing.*
 
@@ -170,17 +308,16 @@ Huffman coding formalised the optimal parameter-free algorithm for symbol-freque
 The core AIM operations — bit-plane sweep, bit-clear, remap, and the rANS encode/decode loop — are branchless, fixed-depth, and operate on independent byte elements, making them amenable to SIMD vectorisation. Existing AVX-512 primitives (VGATHER, VPERMB, VPSHUFB) cover the stride-gather and remap patterns directly. A SIMD-accelerated C implementation and formal throughput analysis are left for future work.
 
 ---
+
 ## Stability and Compatibility
 
 > **This is a research toolkit in active development. It is not an archival format or a production codec.**
 
 ### What this means in practice
 
-**Wire format stability:** The AIM4 wire format is documented in `AIM_Specification` and has been stable since v16. Files encoded with v16 decode correctly with v16-compatible decoders. However, format revisions may occur as the algorithm develops. **Do not use AIM as an archival format for data you cannot recover from the original source.**
+**Wire format stability:** The AIM3 wire format is documented in `AIM_Specification` and has been stable since v16. Files encoded with v16-compatible implementations decode correctly with current decoders. However, format revisions may occur as the algorithm develops. **Do not use AIM as an archival format for data you cannot recover from the original source.**
 
-**Implementation stability:** The C implementation (`aim_v33.c` as of this writing) is iterative research code. Memory behaviour, performance characteristics, and edge-case handling are actively improving. Breaking changes may occur between versions without deprecation notice.
-
-**Memory safety:** The `--disk` mode encoder has been extensively profiled and corrected through v25–v33 to bound peak RAM usage to approximately 2× the input file size. However, residual edge cases may exist. Monitor system memory during encoding of large files and ensure adequate free RAM before starting.
+**Implementation stability:** The C implementation is iterative research code. Memory behaviour, performance characteristics, and edge-case handling are actively improving. Breaking changes may occur between versions without deprecation notice.
 
 **Correctness verification:** Every encode/decode roundtrip is SHA-256 verified by the decoder. If the decoder reports a hash mismatch, the output is corrupt and should be discarded. Never trust an AIM-encoded file without running the decoder to verify it.
 
@@ -196,8 +333,6 @@ The core AIM operations — bit-plane sweep, bit-clear, remap, and the rANS enco
 ### What to use instead for archival or production use
 
 If you need guaranteed long-term format stability, use a mature standard: `gzip`, `zstd`, `bzip2`, `xz`. AIM may eventually outperform them on specific data classes, but that is a research question, not a settled result.
-
----
 
 ---
 
