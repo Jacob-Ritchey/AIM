@@ -2,6 +2,8 @@
 
 **A parameter-free framework for recursive bit-plane decomposition of arbitrary byte data.**
 
+**Website:** [entisol.org](https://entisol.org) · [Research & Sessions](https://entisol.org/aim.html) · [Web Analyzer](https://entisol.org/AIM_Web_Analyzer.html)
+
 ```
 $ ./aim3 encode sample-full.wav sample.aim3
 
@@ -125,7 +127,9 @@ Set `AIMC=/path/to/aim3` to point it at a non-default binary location.
 
 `AIM_Web_Analyzer.html` is a self-contained browser tool for analysing the entropy structure of arbitrary binary files. It has nothing to do with AIM3-encoded containers — it operates on raw data and is used during development to understand what structure is present before deciding how to target it.
 
-Open the HTML file in any browser, drag-and-drop a binary file, and it runs entirely client-side. The analysis is organised into tabs:
+**[Launch the Web Analyzer →](https://entisol.org/AIM_Web_Analyzer.html)** — hosted at entisol.org, no install required.
+
+Alternatively, open the local `AIM_Web_Analyzer.html` file in any browser. Either way, it runs entirely client-side — drag-and-drop a binary file and it runs entirely in your browser. The analysis is organised into tabs:
 
 | Tab | What it shows |
 | --- | --- |
@@ -292,6 +296,8 @@ Container header (64 bytes): `AIM3` magic + version (1B) + original length (8B B
 ## Paper
 
 `Adaptive Isolating Model.pdf` — covers the theoretical foundations, formal proofs, the remap dissolution problem and why HALT_ANS_STRIDE addresses it, the non-domain justification for stride selection, relationship to existing work (bit-plane coding, DPCM, wavelets, LZ77, ANS), the Huffman analogy, and the full empirical evaluation including the fight_club YUV benchmark.
+
+Session reports and incremental development notes are published at [entisol.org/aim.html](https://entisol.org/aim.html).
 
 ---
 
